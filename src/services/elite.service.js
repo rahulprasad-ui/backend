@@ -88,6 +88,26 @@ class EliteService {
       }
     ]);
 
+    // Direct Firebase Firestore sync to therivdata
+    try {
+      const { admin } = require('../config/firebase');
+      if (admin && admin.apps && admin.apps.length > 0) {
+        await admin.firestore().collection('therivdata').doc(uid).set({
+          isElite: true,
+          tier: 'elite',
+          elite_plan: order.plan || 'elite_399',
+          monthlyMinutes: 600,
+          minutesRemaining: 600,
+          premiumStatus: true,
+          isPremium: true,
+          updatedAt: now
+        }, { merge: true });
+        logger.info(`Firebase Firestore therivdata Elite activated for user: ${uid}`);
+      }
+    } catch (fsErr) {
+      logger.warn(`Firebase Firestore Elite sync note: ${fsErr.message}`);
+    }
+
     NotificationService.sendToUser(uid, {
       title: '👑 Welcome to Elite Club!',
       body: 'Your Elite Membership is now active. Enjoy priority advisory and exclusive perks.',

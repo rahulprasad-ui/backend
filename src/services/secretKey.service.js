@@ -177,6 +177,23 @@ class SecretKeyService {
         }
       ]);
 
+      // Direct Firebase Firestore sync to therivdata
+      try {
+        const { admin } = require('../config/firebase');
+        if (admin && admin.apps && admin.apps.length > 0) {
+          await admin.firestore().collection('therivdata').doc(userId).set({
+            premiumStatus: true,
+            isPremium: true,
+            premium_source: 'secret_key',
+            redeemedSecretKey: normalizedKey,
+            updatedAt: now
+          }, { merge: true });
+          logger.info(`Firebase Firestore therivdata secret key unlocked for user: ${userId}`);
+        }
+      } catch (fsErr) {
+        logger.warn(`Firebase Firestore Secret Key sync note: ${fsErr.message}`);
+      }
+
       NotificationService.sendToUser(userId, {
         title: '🎉 Secret Key Activated!',
         body: `Your account has been upgraded to ${String(keyRecord.tier).toUpperCase()} tier.`,

@@ -143,6 +143,26 @@ class PaymentService {
       }
     ]);
 
+    // Direct Firebase Firestore sync to therivdata
+    try {
+      const { admin } = require('../config/firebase');
+      if (admin && admin.apps && admin.apps.length > 0) {
+        await admin.firestore().collection('therivdata').doc(userId).set({
+          premiumStatus: true,
+          isPremium: true,
+          isElite: (order.plan && order.plan.includes('elite')) ? true : undefined,
+          tier: (order.plan && order.plan.includes('elite')) ? 'elite' : undefined,
+          premium_source: 'payment_gateway',
+          lastPaymentOrderId: orderId,
+          lastPaymentAt: now,
+          updatedAt: now
+        }, { merge: true });
+        logger.info(`Firebase Firestore therivdata updated for user: ${userId}`);
+      }
+    } catch (fsErr) {
+      logger.warn(`Firebase Firestore sync note: ${fsErr.message}`);
+    }
+
     NotificationService.sendToUser(userId, {
       title: '🎉 Premium Unlocked!',
       body: 'Your payment was successful. Enjoy full access to Rivava TrackFi features.',
