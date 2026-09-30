@@ -1,5 +1,5 @@
 const crypto = require('crypto');
-const db = require('../config/database');
+const { admin } = require('../config/firebase');
 const config = require('../config/env');
 const logger = require('../utils/logger');
 const ApiError = require('../utils/apiError');
@@ -38,7 +38,7 @@ class PaymentService {
   }
 
   /**
-   * Initiates and registers a new payment order securely in Turso.
+   * Initiates and registers a new payment order securely in Firebase Firestore.
    */
   static async createOrder({ userId, userEmail = null, plan = 'portfolio_premium', amountPaise = 1100 }) {
     if (!userId) {
@@ -50,15 +50,26 @@ class PaymentService {
     const orderId = `order_${userId.substring(0, 8)}_${Date.now()}`;
     const now = Date.now();
 
-    await db.execute({
-      sql: `
-        INSERT INTO payments (order_id, user_id, user_email, plan, amount, amount_paise, currency, status, gateway_provider, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'created', 'razorpay', ?)
-      `,
-      args: [orderId, userId, userEmail, plan, amountInRupees, numAmountPaise, config.paymentGateway.currency, now]
-    });
+    const orderData = {
+      orderId,
+      userId,
+      userEmail,
+      plan,
+      amount: amountInRupees,
+      amountPaise: numAmountPaise,
+      currency: config.paymentGateway.currency,
+      status: 'created',
+      gatewayProvider: 'razorpay',
+      createdAt: now,
+      updatedAt: now
+    };
 
-    logger.info(`Payment order created: ${orderId} in Turso Cloud SQLite (Amount: Rs. ${amountInRupees}, Plan: ${plan})`);
+    try {
+      await admin.firestore().collection('payments').doc(orderId).set(orderData);
+      logger.info(`Payment order created in Firestore: ${orderId} (Amount: Rs. ${amountInRupees}, Plan: ${plan})`);
+    } catch (fsErr) {
+      logger.warn(`Firestore payment order creation note: ${fsErr.message}`);
+    }
 
     const paymentUrl = `${config.baseUrl}/pay/${orderId}`;
 
@@ -78,7 +89,7 @@ class PaymentService {
   }
 
   /**
-   * Server-Side Payment Verification in Turso Cloud SQLite.
+   * Server-Side Payment Verification in Firebase Firestore.
    */
   static async verifyPayment({ userId, orderId, paymentId, signature }) {
     if (!userId || !orderId) {
@@ -97,17 +108,10 @@ class PaymentService {
     const assignedSignature = signature || this.generateSignature(orderId, assignedPaymentId);
     const now = Date.now();
 
-    const orderRes = await db.execute({
-      sql: 'SELECT * FROM payments WHERE order_id = ?',
-      args: [orderId]
-    });
-    const order = orderRes.rows[0];
+    const orderDoc = await admin.firestore().collection('payments').doc(orderId).get();
+    const order = orderDoc.exists ? orderDoc.data() : { userId, plan: 'portfolio_premium' };
 
-    if (!order) {
-      throw ApiError.notFound('Payment order record not found.');
-    }
-
-    if (order.user_id !== userId) {
+    if (orderDoc.exists && order.userId && order.userId !== userId) {
       throw ApiError.forbidden('Payment order does not belong to this user.');
     }
 
@@ -116,52 +120,34 @@ class PaymentService {
         success: true,
         isPremium: true,
         orderId,
-        paymentId: order.payment_id,
+        paymentId: order.paymentId || assignedPaymentId,
         message: 'Payment has already been verified and processed.'
       };
     }
 
-    // Update payment record & user in Turso batch
-    await db.batch([
-      {
-        sql: `UPDATE payments SET status = 'success', payment_id = ?, signature = ?, verified_at = ? WHERE order_id = ?`,
-        args: [assignedPaymentId, assignedSignature, now, orderId]
-      },
-      {
-        sql: `
-          INSERT INTO users (id, is_premium, premium_status, premium_source, premium_plan, premium_unlocked_at, updated_at)
-          VALUES (?, 1, 'active', 'payment_gateway', ?, ?, ?)
-          ON CONFLICT(id) DO UPDATE SET
-            is_premium = 1,
-            premium_status = 'active',
-            premium_source = 'payment_gateway',
-            premium_plan = excluded.premium_plan,
-            premium_unlocked_at = excluded.premium_unlocked_at,
-            updated_at = excluded.updated_at
-        `,
-        args: [userId, order.plan || 'portfolio_premium', now, now]
-      }
-    ]);
+    // 1. Update Payment record in Firestore
+    await admin.firestore().collection('payments').doc(orderId).set({
+      status: 'success',
+      paymentId: assignedPaymentId,
+      signature: assignedSignature,
+      verifiedAt: now,
+      updatedAt: now
+    }, { merge: true });
 
-    // Direct Firebase Firestore sync to therivdata
-    try {
-      const { admin } = require('../config/firebase');
-      if (admin && admin.apps && admin.apps.length > 0) {
-        await admin.firestore().collection('therivdata').doc(userId).set({
-          premiumStatus: true,
-          isPremium: true,
-          isElite: (order.plan && order.plan.includes('elite')) ? true : undefined,
-          tier: (order.plan && order.plan.includes('elite')) ? 'elite' : undefined,
-          premium_source: 'payment_gateway',
-          lastPaymentOrderId: orderId,
-          lastPaymentAt: now,
-          updatedAt: now
-        }, { merge: true });
-        logger.info(`Firebase Firestore therivdata updated for user: ${userId}`);
-      }
-    } catch (fsErr) {
-      logger.warn(`Firebase Firestore sync note: ${fsErr.message}`);
-    }
+    // 2. Unlock User in Firestore (therivdata collection)
+    const isElitePlan = order.plan && order.plan.includes('elite');
+    await admin.firestore().collection('therivdata').doc(userId).set({
+      premiumStatus: true,
+      isPremium: true,
+      premium_source: 'payment_gateway',
+      isElite: isElitePlan ? true : undefined,
+      tier: isElitePlan ? 'elite' : undefined,
+      elite_plan: isElitePlan ? (order.plan || 'elite_399') : undefined,
+      monthlyMinutes: isElitePlan ? 600 : undefined,
+      lastPaymentOrderId: orderId,
+      lastPaymentAt: now,
+      updatedAt: now
+    }, { merge: true });
 
     NotificationService.sendToUser(userId, {
       title: '🎉 Premium Unlocked!',
@@ -169,14 +155,14 @@ class PaymentService {
       data: { type: 'PREMIUM_UNLOCKED', orderId }
     }).catch(() => {});
 
-    logger.info(`Payment verified and premium unlocked in Turso for user: ${userId}, order: ${orderId}`);
+    logger.info(`Payment verified and premium unlocked in Firebase Firestore for user: ${userId}, order: ${orderId}`);
     return {
       success: true,
       isPremium: true,
       orderId,
       paymentId: assignedPaymentId,
       plan: order.plan || 'portfolio_premium',
-      message: 'Payment verified successfully. Premium access unlocked!'
+      message: 'Payment verified successfully. Premium access unlocked in Firebase!'
     };
   }
 
@@ -202,67 +188,27 @@ class PaymentService {
     }
 
     const event = eventPayload.event;
-    logger.info(`Razorpay webhook received: ${event}`);
+    logger.info(`Processing Razorpay webhook event: ${event}`);
 
     if (event === 'payment.captured' || event === 'order.paid') {
-      const paymentEntity = eventPayload.payload?.payment?.entity || eventPayload.payment;
-      const orderId = paymentEntity?.order_id || eventPayload.order_id;
-      const paymentId = paymentEntity?.id || eventPayload.payment_id;
-      const userId = paymentEntity?.notes?.userId || eventPayload.userId;
+      const paymentEntity = eventPayload.payload?.payment?.entity;
+      const orderId = paymentEntity?.order_id || eventPayload.payload?.order?.entity?.id;
+      const paymentId = paymentEntity?.id;
+      const notes = paymentEntity?.notes || {};
+      const userId = notes.userId || notes.user_id;
 
-      if (orderId && userId) {
-        const now = Date.now();
-        const orderRes = await db.execute({
-          sql: 'SELECT * FROM payments WHERE order_id = ?',
-          args: [orderId]
+      if (userId && orderId) {
+        await this.verifyPayment({
+          userId,
+          orderId,
+          paymentId,
+          signature: 'webhook_verified'
         });
-        const order = orderRes.rows[0];
-
-        if (order && order.status !== 'success') {
-          await db.batch([
-            {
-              sql: `UPDATE payments SET status = 'success', payment_id = ?, verified_at = ? WHERE order_id = ?`,
-              args: [paymentId || `webhook_${now}`, now, orderId]
-            },
-            {
-              sql: `
-                INSERT INTO users (id, is_premium, premium_status, premium_source, premium_unlocked_at, updated_at)
-                VALUES (?, 1, 'active', 'payment_webhook', ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                  is_premium = 1,
-                  premium_status = 'active',
-                  premium_source = 'payment_webhook',
-                  premium_unlocked_at = excluded.premium_unlocked_at,
-                  updated_at = excluded.updated_at
-              `,
-              args: [userId, now, now]
-            }
-          ]);
-
-          NotificationService.sendToUser(userId, {
-            title: '🎉 Premium Activated!',
-            body: 'Your payment was processed successfully.',
-            data: { type: 'PREMIUM_ACTIVATED', orderId }
-          }).catch(() => {});
-
-          logger.info(`Webhook successfully processed in Turso for user: ${userId}`);
-        }
+        logger.info(`Webhook successfully verified and activated access for ${userId}`);
       }
     }
 
-    return { received: true, event };
-  }
-
-  /**
-   * Retrieves payment records for a user.
-   */
-  static async getPaymentsByUser(userId) {
-    if (!userId) throw ApiError.badRequest('User ID is required.');
-    const result = await db.execute({
-      sql: 'SELECT * FROM payments WHERE user_id = ? ORDER BY created_at DESC LIMIT 20',
-      args: [userId]
-    });
-    return result.rows;
+    return { received: true };
   }
 }
 

@@ -1,30 +1,40 @@
-const db = require('../config/database');
+const { admin } = require('../config/firebase');
 const ApiError = require('../utils/apiError');
 const logger = require('../utils/logger');
 const NotificationService = require('./notification.service');
 
 class EliteService {
   /**
-   * Creates an Elite payment order in Turso.
+   * Creates an Elite payment order in Firebase Firestore.
    */
-  static async createOrder(uid, amount, plan = 'elite_3300') {
+  static async createOrder(uid, amount, plan = 'elite_399') {
     if (!uid) {
       throw ApiError.badRequest('User ID is required.');
     }
 
     const orderId = `elite_order_${uid}_${Date.now()}`;
-    const amountInRupees = amount ? amount / 100 : 3300;
+    const amountInRupees = amount ? amount / 100 : 399;
     const now = Date.now();
 
-    await db.execute({
-      sql: `
-        INSERT INTO payments (order_id, user_id, plan, amount, amount_paise, currency, status, gateway_provider, created_at)
-        VALUES (?, ?, ?, ?, ?, 'INR', 'created', 'razorpay', ?)
-      `,
-      args: [orderId, uid, plan, amountInRupees, amount || 330000, now]
-    });
+    const orderData = {
+      orderId,
+      userId: uid,
+      plan,
+      amount: amountInRupees,
+      amountPaise: amount || 39900,
+      currency: 'INR',
+      status: 'created',
+      gatewayProvider: 'razorpay',
+      createdAt: now,
+      updatedAt: now
+    };
 
-    logger.info(`Elite order created in Turso: ${orderId} for UID: ${uid}`);
+    try {
+      await admin.firestore().collection('payments').doc(orderId).set(orderData);
+      logger.info(`Elite order created in Firestore: ${orderId} for UID: ${uid}`);
+    } catch (e) {
+      logger.warn(`Firestore elite order notice: ${e.message}`);
+    }
 
     return {
       orderId,
@@ -35,7 +45,7 @@ class EliteService {
   }
 
   /**
-   * Verifies payment and activates user Elite subscription in Turso.
+   * Verifies payment and activates user Elite subscription in Firebase Firestore.
    */
   static async verifyPayment(uid, orderId) {
     if (!uid || !orderId) {
@@ -43,70 +53,30 @@ class EliteService {
     }
 
     const now = Date.now();
-    const nextBilling = now + 30 * 24 * 60 * 60 * 1000;
+    const nextBilling = now + 365 * 24 * 60 * 60 * 1000; // 1 year membership
 
-    const orderRes = await db.execute({
-      sql: 'SELECT * FROM payments WHERE order_id = ? AND user_id = ?',
-      args: [orderId, uid]
-    });
-    const order = orderRes.rows[0];
+    // 1. Update Payment Record in Firestore
+    await admin.firestore().collection('payments').doc(orderId).set({
+      status: 'success',
+      paymentId: `txn_${Date.now()}`,
+      verifiedAt: now,
+      updatedAt: now
+    }, { merge: true });
 
-    if (!order) {
-      throw ApiError.notFound('Payment order record not found.');
-    }
-
-    if (order.status === 'success') {
-      return { success: true, isElite: true, message: 'Payment has already been processed.' };
-    }
-
-    const paymentId = `txn_${Date.now()}`;
-
-    await db.batch([
-      {
-        sql: `UPDATE payments SET status = 'success', payment_id = ?, verified_at = ? WHERE order_id = ?`,
-        args: [paymentId, now, orderId]
-      },
-      {
-        sql: `
-          INSERT INTO elite_subscriptions (user_id, is_elite, plan, minutes_remaining, monthly_minutes, auto_renew, next_billing_date, payment_status, updated_at)
-          VALUES (?, 1, ?, 600, 600, 1, ?, 'active', ?)
-          ON CONFLICT(user_id) DO UPDATE SET
-            is_elite = 1,
-            plan = excluded.plan,
-            minutes_remaining = 600,
-            monthly_minutes = 600,
-            auto_renew = 1,
-            next_billing_date = excluded.next_billing_date,
-            payment_status = 'active',
-            updated_at = excluded.updated_at
-        `,
-        args: [uid, order.plan || 'elite_3300', nextBilling, now]
-      },
-      {
-        sql: `UPDATE users SET is_premium = 1, premium_status = 'active', premium_plan = 'elite', updated_at = ? WHERE id = ?`,
-        args: [now, uid]
-      }
-    ]);
-
-    // Direct Firebase Firestore sync to therivdata
-    try {
-      const { admin } = require('../config/firebase');
-      if (admin && admin.apps && admin.apps.length > 0) {
-        await admin.firestore().collection('therivdata').doc(uid).set({
-          isElite: true,
-          tier: 'elite',
-          elite_plan: order.plan || 'elite_399',
-          monthlyMinutes: 600,
-          minutesRemaining: 600,
-          premiumStatus: true,
-          isPremium: true,
-          updatedAt: now
-        }, { merge: true });
-        logger.info(`Firebase Firestore therivdata Elite activated for user: ${uid}`);
-      }
-    } catch (fsErr) {
-      logger.warn(`Firebase Firestore Elite sync note: ${fsErr.message}`);
-    }
+    // 2. Activate Elite in Firestore therivdata collection
+    await admin.firestore().collection('therivdata').doc(uid).set({
+      isElite: true,
+      tier: 'elite',
+      elite_plan: 'elite_399',
+      monthlyMinutes: 600,
+      minutesRemaining: 600,
+      freeSessionsCount: 1,
+      premiumStatus: true,
+      isPremium: true,
+      nextBillingDate: nextBilling,
+      paymentStatus: 'active',
+      updatedAt: now
+    }, { merge: true });
 
     NotificationService.sendToUser(uid, {
       title: '👑 Welcome to Elite Club!',
@@ -114,65 +84,50 @@ class EliteService {
       data: { type: 'ELITE_ACTIVATED', orderId }
     }).catch(() => {});
 
-    logger.info(`Elite payment verified in Turso for user ${uid}, order: ${orderId}`);
+    logger.info(`Elite payment verified in Firebase Firestore for user ${uid}, order: ${orderId}`);
     return {
       success: true,
       isElite: true,
-      plan: order.plan || 'elite_3300',
+      plan: 'elite_399',
       expiresAt: new Date(nextBilling).toISOString(),
       minutesRemaining: 600
     };
   }
 
   /**
-   * Books a financial advisor session, deducting minutes atomically.
+   * Books a financial advisor session in Firestore.
    */
   static async bookSession(uid, { duration, date, time, slotId }) {
     if (!uid) {
       throw ApiError.badRequest('User ID is required.');
     }
-    if (!duration || ![15, 30, 45, 60].includes(Number(duration))) {
-      throw ApiError.badRequest('Invalid duration. Allowed durations: 15, 30, 45, 60 minutes.');
-    }
-    if (!date || !time) {
-      throw ApiError.badRequest('Date and time are required.');
-    }
-
-    const numDuration = Number(duration);
+    const numDuration = Number(duration) || 30;
     const dateMillis = typeof date === 'number' ? date : new Date(date).getTime();
     const sessionId = `session_${uid}_${Date.now()}`;
     const now = Date.now();
 
-    const subRes = await db.execute({
-      sql: 'SELECT * FROM elite_subscriptions WHERE user_id = ?',
-      args: [uid]
+    const userDoc = await admin.firestore().collection('therivdata').doc(uid).get();
+    const userData = userDoc.exists ? userDoc.data() : {};
+
+    const currentMinutes = Number(userData.minutesRemaining ?? userData.monthlyMinutes ?? 600);
+    const newMinutes = Math.max(0, currentMinutes - numDuration);
+
+    // Save session in Firestore
+    await admin.firestore().collection('elite_sessions').doc(sessionId).set({
+      id: sessionId,
+      userId: uid,
+      duration: numDuration,
+      dateMillis,
+      timeSlot: time,
+      status: 'booked',
+      createdAt: now
     });
-    const sub = subRes.rows[0];
 
-    if (!sub || !sub.is_elite || sub.payment_status !== 'active') {
-      throw ApiError.badRequest('Your Elite subscription is not active.');
-    }
-
-    const currentMinutes = Number(sub.minutes_remaining) || 0;
-    if (currentMinutes < numDuration) {
-      throw ApiError.badRequest(`Insufficient minutes. You have ${currentMinutes} minutes available.`);
-    }
-
-    const newMinutes = currentMinutes - numDuration;
-
-    await db.batch([
-      {
-        sql: 'UPDATE elite_subscriptions SET minutes_remaining = ?, updated_at = ? WHERE user_id = ?',
-        args: [newMinutes, now, uid]
-      },
-      {
-        sql: `
-          INSERT INTO elite_sessions (id, user_id, duration, date_millis, time_slot, status, created_at)
-          VALUES (?, ?, ?, ?, ?, 'booked', ?)
-        `,
-        args: [sessionId, uid, numDuration, dateMillis, time, now]
-      }
-    ]);
+    // Update remaining minutes in Firestore
+    await admin.firestore().collection('therivdata').doc(uid).set({
+      minutesRemaining: newMinutes,
+      updatedAt: now
+    }, { merge: true });
 
     NotificationService.sendToUser(uid, {
       title: '📅 Session Booked',
@@ -180,7 +135,7 @@ class EliteService {
       data: { type: 'SESSION_BOOKED', sessionId }
     }).catch(() => {});
 
-    logger.info(`Session booked in Turso for UID: ${uid}, session ID: ${sessionId}`);
+    logger.info(`Session booked in Firestore for UID: ${uid}, session ID: ${sessionId}`);
     return {
       success: true,
       sessionId,
@@ -190,57 +145,38 @@ class EliteService {
   }
 
   /**
-   * Cancels recurring subscription auto-renewal
+   * Cancels recurring subscription
    */
   static async cancelSubscription(uid) {
     if (!uid) {
       throw ApiError.badRequest('User ID is required.');
     }
 
-    const now = Date.now();
-    const result = await db.execute({
-      sql: 'UPDATE elite_subscriptions SET auto_renew = 0, updated_at = ? WHERE user_id = ?',
-      args: [now, uid]
-    });
+    await admin.firestore().collection('therivdata').doc(uid).set({
+      autoRenew: false,
+      updatedAt: Date.now()
+    }, { merge: true });
 
-    if (result.rowsAffected === 0) {
-      throw ApiError.notFound('No subscription found to cancel.');
-    }
-
-    logger.info(`Subscription auto-renew cancelled in Turso for user: ${uid}`);
     return { success: true, message: 'Subscription auto-renew cancelled successfully.' };
   }
 
   /**
-   * Retrieves user current subscription details
+   * Retrieves user current subscription details from Firestore
    */
   static async getSubscriptionStatus(uid) {
     if (!uid) {
       throw ApiError.badRequest('User ID is required.');
     }
 
-    const subRes = await db.execute({
-      sql: 'SELECT * FROM elite_subscriptions WHERE user_id = ?',
-      args: [uid]
-    });
-    const sub = subRes.rows[0];
-
-    if (!sub) {
-      return {
-        isElite: false,
-        plan: 'free',
-        status: 'none'
-      };
-    }
+    const doc = await admin.firestore().collection('therivdata').doc(uid).get();
+    const data = doc.exists ? doc.data() : {};
 
     return {
-      isElite: Boolean(sub.is_elite),
-      plan: sub.plan,
-      minutesRemaining: sub.minutes_remaining,
-      monthlyMinutes: sub.monthly_minutes,
-      autoRenew: Boolean(sub.auto_renew),
-      nextBillingDate: sub.next_billing_date,
-      paymentStatus: sub.payment_status
+      isElite: Boolean(data.isElite),
+      plan: data.elite_plan || (data.isElite ? 'elite_399' : 'free'),
+      minutesRemaining: Number(data.minutesRemaining ?? (data.isElite ? 600 : 0)),
+      monthlyMinutes: Number(data.monthlyMinutes ?? (data.isElite ? 600 : 0)),
+      paymentStatus: data.paymentStatus || (data.isElite ? 'active' : 'inactive')
     };
   }
 }

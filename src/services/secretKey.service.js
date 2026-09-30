@@ -1,5 +1,5 @@
 const crypto = require('crypto');
-const db = require('../config/database');
+const { admin } = require('../config/firebase');
 const logger = require('../utils/logger');
 const NotificationService = require('./notification.service');
 
@@ -7,7 +7,7 @@ const KEY_CHARSET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
 
 class SecretKeyService {
   /**
-   * Generate a cryptographically secure, unpredictable, random license key.
+   * Generate a cryptographically secure license key string.
    */
   static generateRandomKeyString(prefix = 'RIV') {
     const segments = 4;
@@ -36,7 +36,7 @@ class SecretKeyService {
   }
 
   /**
-   * Generates and stores new secure keys in Turso.
+   * Generates and stores new secure keys in Firebase Firestore.
    */
   static async createSecretKey({
     tier = 'portfolio_premium',
@@ -52,213 +52,174 @@ class SecretKeyService {
     const expiresAt = expiresInDays ? (now + expiresInDays * 24 * 60 * 60 * 1000) : null;
     const cleanEmail = assignedEmail ? assignedEmail.toLowerCase().trim() : null;
 
-    await db.execute({
-      sql: `
-        INSERT INTO secret_keys (key_string, tier, max_uses, current_uses, assigned_email, expires_at, notes, created_by, is_active, created_at)
-        VALUES (?, ?, ?, 0, ?, ?, ?, ?, 1, ?)
-      `,
-      args: [rawKey, tier, Number(maxUses) || 1, cleanEmail, expiresAt, notes, createdBy, now]
-    });
+    const keyData = {
+      keyString: rawKey,
+      tier,
+      maxUses: Number(maxUses) || 1,
+      currentUses: 0,
+      assignedEmail: cleanEmail,
+      expiresAt,
+      notes,
+      createdBy,
+      isActive: true,
+      status: 'active',
+      redeemedBy: [],
+      createdAt: now
+    };
 
-    logger.info(`Secure Secret Key created in Turso: ${rawKey.substring(0, 8)}... (Tier: ${tier}, MaxUses: ${maxUses})`);
+    await admin.firestore().collection('secret_keys').doc(rawKey).set(keyData);
+    logger.info(`Secret key generated in Firebase Firestore: ${rawKey}`);
 
     return {
       key: rawKey,
       tier,
       maxUses: Number(maxUses) || 1,
-      expiresAt
+      assignedEmail: cleanEmail,
+      expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null,
+      createdAt: new Date(now).toISOString()
     };
   }
 
   /**
-   * Atomically verifies and redeems a secret key for a specific user in Turso.
+   * Validates a secret key in Firebase Firestore without redeeming it.
    */
-  static async verifyAndRedeemKey({ keyString, userId, userEmail }) {
-    if (!keyString || !keyString.trim()) {
-      return { success: false, code: 'EMPTY_KEY', message: 'Please enter a valid secret key.' };
+  static async validateSecretKey(rawKey, userEmail = null) {
+    const normalizedKey = this.normalizeKey(rawKey);
+    if (!normalizedKey || normalizedKey.length < 8) {
+      return { isValid: false, code: 'INVALID_FORMAT', message: 'Invalid key format.' };
     }
 
-    if (!userId) {
-      return { success: false, code: 'UNAUTHORIZED', message: 'User authentication is required to redeem a key.' };
+    const doc = await admin.firestore().collection('secret_keys').doc(normalizedKey).get();
+    if (!doc.exists) {
+      return { isValid: false, code: 'NOT_FOUND', message: 'Secret key not found.' };
+    }
+
+    const keyRecord = doc.data();
+
+    if (!keyRecord.isActive || keyRecord.status === 'revoked') {
+      return { isValid: false, code: 'KEY_REVOKED', message: 'This secret key has been revoked.' };
+    }
+
+    if (keyRecord.expiresAt && Date.now() > keyRecord.expiresAt) {
+      return { isValid: false, code: 'KEY_EXPIRED', message: 'This secret key has expired.' };
+    }
+
+    if (keyRecord.assignedEmail && userEmail) {
+      if (keyRecord.assignedEmail.toLowerCase() !== userEmail.toLowerCase()) {
+        return { isValid: false, code: 'EMAIL_MISMATCH', message: 'This key was assigned to a different account.' };
+      }
+    }
+
+    const currentUses = Number(keyRecord.currentUses) || 0;
+    const maxUses = Number(keyRecord.maxUses) || 1;
+
+    if (currentUses >= maxUses) {
+      return { isValid: false, code: 'ALREADY_REDEEMED', message: 'This key has reached maximum uses.' };
+    }
+
+    return {
+      isValid: true,
+      key: normalizedKey,
+      tier: keyRecord.tier || 'portfolio_premium',
+      usesRemaining: maxUses - currentUses
+    };
+  }
+
+  /**
+   * Atomically redeems a secret key and unlocks user in Firebase Firestore.
+   */
+  static async redeemSecretKey({ keyString, userId, userEmail = null }) {
+    if (!keyString || !userId) {
+      return { success: false, code: 'INVALID_REQUEST', message: 'Key and User ID are required.' };
     }
 
     const normalizedKey = this.normalizeKey(keyString);
+    const firestore = admin.firestore();
+    const keyRef = firestore.collection('secret_keys').doc(normalizedKey);
+    const userRef = firestore.collection('therivdata').doc(userId);
     const now = Date.now();
 
     try {
-      const keyRes = await db.execute({
-        sql: 'SELECT * FROM secret_keys WHERE key_string = ?',
-        args: [normalizedKey]
+      const result = await firestore.runTransaction(async (transaction) => {
+        const keyDoc = await transaction.get(keyRef);
+        if (!keyDoc.exists) {
+          return { success: false, code: 'NOT_FOUND', message: 'Secret key not found.' };
+        }
+
+        const keyData = keyDoc.data();
+        if (!keyData.isActive || keyData.status === 'revoked') {
+          return { success: false, code: 'KEY_REVOKED', message: 'This secret key has been revoked.' };
+        }
+
+        if (keyData.expiresAt && now > keyData.expiresAt) {
+          return { success: false, code: 'KEY_EXPIRED', message: 'This secret key has expired.' };
+        }
+
+        if (keyData.assignedEmail && userEmail) {
+          if (keyData.assignedEmail.toLowerCase() !== userEmail.toLowerCase()) {
+            return { success: false, code: 'EMAIL_MISMATCH', message: 'This key was issued for a different account.' };
+          }
+        }
+
+        const currentUses = Number(keyData.currentUses) || 0;
+        const maxUses = Number(keyData.maxUses) || 1;
+
+        if (currentUses >= maxUses) {
+          return { success: false, code: 'ALREADY_REDEEMED', message: 'This secret key has reached maximum uses.' };
+        }
+
+        const redeemedBy = keyData.redeemedBy || [];
+        if (redeemedBy.some(r => r.userId === userId)) {
+          return { success: false, code: 'ALREADY_CLAIMED', message: 'You have already activated this key.' };
+        }
+
+        const newUses = currentUses + 1;
+        const newStatus = newUses >= maxUses ? 'redeemed' : 'active';
+        const redemptionEntry = {
+          userId,
+          userEmail: userEmail || '',
+          redeemedAt: now
+        };
+
+        // 1. Update key document in Firestore
+        transaction.update(keyRef, {
+          currentUses: newUses,
+          status: newStatus,
+          redeemedBy: [...redeemedBy, redemptionEntry],
+          lastRedeemedAt: now,
+          updatedAt: now
+        });
+
+        // 2. Unlock User in Firestore therivdata collection
+        transaction.set(userRef, {
+          premiumStatus: true,
+          isPremium: true,
+          premium_source: 'secret_key',
+          redeemedSecretKey: normalizedKey,
+          updatedAt: now
+        }, { merge: true });
+
+        return {
+          success: true,
+          tier: keyData.tier || 'portfolio_premium',
+          message: 'Secret key redeemed successfully. Access unlocked!'
+        };
       });
-      const keyRecord = keyRes.rows[0];
 
-      if (!keyRecord) {
-        return {
-          success: false,
-          code: 'INVALID_KEY',
-          message: 'Invalid secret key. Please check and try again.'
-        };
+      if (result.success) {
+        NotificationService.sendToUser(userId, {
+          title: '🎉 Secret Key Activated!',
+          body: `Your account has been upgraded to ${String(result.tier).toUpperCase()} tier.`,
+          data: { type: 'KEY_REDEEMED', key: normalizedKey }
+        }).catch(() => {});
+        logger.info(`Secret key ${normalizedKey} redeemed in Firestore for user ${userId}`);
       }
 
-      if (!keyRecord.is_active) {
-        return {
-          success: false,
-          code: 'KEY_REVOKED',
-          message: 'This key has been revoked or deactivated.'
-        };
-      }
-
-      if (keyRecord.expires_at && now > Number(keyRecord.expires_at)) {
-        return {
-          success: false,
-          code: 'KEY_EXPIRED',
-          message: 'This secret key has expired.'
-        };
-      }
-
-      if (keyRecord.assigned_email && userEmail) {
-        if (keyRecord.assigned_email.toLowerCase() !== userEmail.toLowerCase()) {
-          return {
-            success: false,
-            code: 'EMAIL_MISMATCH',
-            message: 'This key was issued for a different account.'
-          };
-        }
-      }
-
-      const currentUses = Number(keyRecord.current_uses) || 0;
-      const maxUses = Number(keyRecord.max_uses) || 1;
-
-      if (currentUses >= maxUses) {
-        return {
-          success: false,
-          code: 'ALREADY_REDEEMED',
-          message: 'This secret key has reached its maximum uses.'
-        };
-      }
-
-      const existingClaimRes = await db.execute({
-        sql: 'SELECT * FROM secret_key_redemptions WHERE key_string = ? AND user_id = ?',
-        args: [normalizedKey, userId]
-      });
-
-      if (existingClaimRes.rows.length > 0) {
-        return {
-          success: false,
-          code: 'ALREADY_CLAIMED_BY_USER',
-          message: 'You have already activated this key on your account.'
-        };
-      }
-
-      // Apply redemption updates via batch
-      const newUses = currentUses + 1;
-      await db.batch([
-        {
-          sql: 'UPDATE secret_keys SET current_uses = ? WHERE key_string = ?',
-          args: [newUses, normalizedKey]
-        },
-        {
-          sql: 'INSERT INTO secret_key_redemptions (key_string, user_id, user_email, redeemed_at) VALUES (?, ?, ?, ?)',
-          args: [normalizedKey, userId, userEmail || null, now]
-        },
-        {
-          sql: `
-            INSERT INTO users (id, is_premium, premium_status, premium_source, premium_plan, premium_unlocked_at, updated_at)
-            VALUES (?, 1, 'active', 'secret_key', ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-              is_premium = 1,
-              premium_status = 'active',
-              premium_source = 'secret_key',
-              premium_plan = excluded.premium_plan,
-              premium_unlocked_at = excluded.premium_unlocked_at,
-              updated_at = excluded.updated_at
-          `,
-          args: [userId, keyRecord.tier || 'portfolio_premium', now, now]
-        }
-      ]);
-
-      // Direct Firebase Firestore sync to therivdata
-      try {
-        const { admin } = require('../config/firebase');
-        if (admin && admin.apps && admin.apps.length > 0) {
-          await admin.firestore().collection('therivdata').doc(userId).set({
-            premiumStatus: true,
-            isPremium: true,
-            premium_source: 'secret_key',
-            redeemedSecretKey: normalizedKey,
-            updatedAt: now
-          }, { merge: true });
-          logger.info(`Firebase Firestore therivdata secret key unlocked for user: ${userId}`);
-        }
-      } catch (fsErr) {
-        logger.warn(`Firebase Firestore Secret Key sync note: ${fsErr.message}`);
-      }
-
-      NotificationService.sendToUser(userId, {
-        title: '🎉 Secret Key Activated!',
-        body: `Your account has been upgraded to ${String(keyRecord.tier).toUpperCase()} tier.`,
-        data: { type: 'KEY_REDEEMED', tier: keyRecord.tier }
-      }).catch(() => {});
-
-      return {
-        success: true,
-        code: 'SUCCESS',
-        tier: keyRecord.tier || 'portfolio_premium',
-        message: 'Premium access successfully unlocked!'
-      };
-    } catch (error) {
-      logger.error('Error during key redemption in Turso:', error);
-      return {
-        success: false,
-        code: 'TRANSACTION_ERROR',
-        message: 'An error occurred while verifying the key. Please try again.'
-      };
+      return result;
+    } catch (err) {
+      logger.error('Error in redeemSecretKey Firestore transaction:', err);
+      return { success: false, code: 'ERROR', message: 'Failed to redeem secret key.' };
     }
-  }
-
-  /**
-   * Revoke a key.
-   */
-  static async revokeKey(keyString) {
-    const normalizedKey = this.normalizeKey(keyString);
-    const result = await db.execute({
-      sql: 'UPDATE secret_keys SET is_active = 0 WHERE key_string = ?',
-      args: [normalizedKey]
-    });
-    return { success: result.rowsAffected > 0, message: result.rowsAffected > 0 ? 'Key revoked.' : 'Key not found.' };
-  }
-
-  /**
-   * Get metadata and status for a secret key.
-   */
-  static async getKeyStatus(keyString) {
-    const normalizedKey = this.normalizeKey(keyString);
-    const keyRes = await db.execute({
-      sql: 'SELECT * FROM secret_keys WHERE key_string = ?',
-      args: [normalizedKey]
-    });
-    const key = keyRes.rows[0];
-
-    if (!key) {
-      return { exists: false };
-    }
-
-    const redemptionsRes = await db.execute({
-      sql: 'SELECT COUNT(*) as count FROM secret_key_redemptions WHERE key_string = ?',
-      args: [normalizedKey]
-    });
-
-    return {
-      exists: true,
-      key: key.key_string,
-      tier: key.tier,
-      isActive: Boolean(key.is_active),
-      maxUses: key.max_uses,
-      currentUses: key.current_uses,
-      redeemedCount: redemptionsRes.rows[0]?.count || 0,
-      createdAt: key.created_at,
-      expiresAt: key.expires_at
-    };
   }
 }
 
