@@ -2,7 +2,6 @@ services:
   - type: web
     name: rivava-backend-api
     runtime: node
-    rootDir: backend
     buildCommand: npm install
     startCommand: npm start
     plan: free
@@ -13,7 +12,7 @@ services:
       - key: NODE_ENV
         value: production
       - key: PORT
-        value: 10000
+        value: 3000
       - key: CORS_ORIGIN
         value: "*"
       - key: RESEND_API_KEY

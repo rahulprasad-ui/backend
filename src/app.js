@@ -45,6 +45,24 @@ app.get('/verify', VerificationController.verifyToken);
 // Direct Link for Password Reset Web Redirect (e.g. /reset?token=...&email=...)
 app.get('/reset', AuthController.handleResetRedirect);
 
+// Root Landing & Status Endpoint
+app.get('/', (req, res) => {
+  res.status(200).json({
+    success: true,
+    service: 'Rivava-TrackFi-Backend-API',
+    status: 'ONLINE',
+    version: '1.0.0',
+    timestamp: new Date().toISOString(),
+    endpoints: {
+      health: '/health',
+      apiV1: '/api/v1'
+    }
+  });
+});
+
+// Favicon handler
+app.get('/favicon.ico', (req, res) => res.status(204).end());
+
 // Health Check (Root level)
 app.use('/health', healthRoutes);
 
