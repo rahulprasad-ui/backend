@@ -221,6 +221,44 @@ class SecretKeyService {
       return { success: false, code: 'ERROR', message: 'Failed to redeem secret key.' };
     }
   }
+
+  /**
+   * Alias for verifyAndRedeemKey
+   */
+  static async verifyAndRedeemKey(params) {
+    return this.redeemSecretKey(params);
+  }
+
+  /**
+   * Alias / wrapper for getKeyStatus
+   */
+  static async getKeyStatus(keyString) {
+    const res = await this.validateSecretKey(keyString);
+    if (!res.isValid) {
+      return { success: false, ...res };
+    }
+    return { success: true, ...res };
+  }
+
+  /**
+   * Revoke a secret key
+   */
+  static async revokeKey(secretKey, reason = '') {
+    const normalizedKey = this.normalizeKey(secretKey);
+    const keyRef = admin.firestore().collection('secret_keys').doc(normalizedKey);
+    const doc = await keyRef.get();
+    if (!doc.exists) {
+      return { success: false, message: 'Secret key not found.' };
+    }
+    await keyRef.update({
+      isActive: false,
+      status: 'revoked',
+      revocationReason: reason,
+      revokedAt: Date.now(),
+      updatedAt: Date.now()
+    });
+    return { success: true, message: `Key ${normalizedKey} revoked successfully.` };
+  }
 }
 
 module.exports = SecretKeyService;
