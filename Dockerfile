@@ -1,10 +1,10 @@
-# Multi-stage production Dockerfile for Rivava Backend
-FROM node:20-alpine AS builder
+# Production Dockerfile for Rivava Backend (Debian-slim for 100% stable SQLite native C++ binaries)
+FROM node:20-slim AS builder
 
 WORKDIR /app
 
-# Install native compilation dependencies for better-sqlite3
-RUN apk add --no-cache python3 make g++ gcc
+# Install build tools for native addons
+RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ && rm -rf /var/lib/apt/lists/*
 
 COPY package*.json ./
 RUN npm ci --only=production
@@ -12,16 +12,16 @@ RUN npm ci --only=production
 COPY . .
 
 # Production Runner
-FROM node:20-alpine AS runner
+FROM node:20-slim AS runner
 
 WORKDIR /app
 
 ENV NODE_ENV=production
 ENV PORT=3000
 
-# Create non-root system user and persistent SQLite data directory
-RUN addgroup -g 1001 -S nodejs && \
-    adduser -S nodejs -u 1001 -G nodejs && \
+# Create persistent data directory and non-root user
+RUN groupadd -g 1001 nodejs && \
+    useradd -u 1001 -g nodejs -s /bin/sh nodejs && \
     mkdir -p /app/data && \
     chown -R nodejs:nodejs /app
 

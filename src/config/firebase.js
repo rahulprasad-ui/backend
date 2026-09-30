@@ -7,35 +7,46 @@ let isInitialized = false;
 
 function initFirebase() {
   if (isInitialized) {
-    return { admin, db: admin.firestore() };
+    return { admin };
   }
 
   try {
-    if (fs.existsSync(config.firebase.serviceAccountPath)) {
+    // 1. Direct JSON from environment variable (Best for Render/Cloud platforms)
+    if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+      const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount)
+      });
+      logger.info('Firebase Admin initialized with FIREBASE_SERVICE_ACCOUNT_JSON.');
+      isInitialized = true;
+      return { admin };
+    }
+
+    // 2. Physical serviceAccountKey.json file
+    if (config.firebase.serviceAccountPath && fs.existsSync(config.firebase.serviceAccountPath)) {
       const serviceAccount = JSON.parse(fs.readFileSync(config.firebase.serviceAccountPath, 'utf8'));
       admin.initializeApp({
         credential: admin.credential.cert(serviceAccount)
       });
-      logger.info('Firebase Admin initialized with service account key.');
-    } else {
-      logger.warn(`serviceAccountKey.json not found at: ${config.firebase.serviceAccountPath}. Initializing with projectId.`);
-      admin.initializeApp({
-        projectId: config.firebase.projectId || 'rivava-signin'
-      });
+      logger.info('Firebase Admin initialized with service account key file.');
+      isInitialized = true;
+      return { admin };
     }
+
+    // 3. Fallback: Project ID initialization
+    const projectId = config.firebase.projectId || process.env.FIREBASE_PROJECT_ID || 'rivavatrackfi';
+    admin.initializeApp({
+      projectId
+    });
+    logger.info(`Firebase Admin initialized with Project ID: ${projectId}`);
     isInitialized = true;
   } catch (error) {
-    logger.error('Failed to initialize Firebase Admin SDK:', error);
-    // Do not crash immediately in dev to allow tests/health endpoints
-    if (config.env === 'production') {
-      throw error;
-    }
+    logger.warn(`Firebase Admin initialization notice: ${error.message}`);
   }
 
-  const db = admin.firestore();
-  return { admin, db };
+  return { admin };
 }
 
-const { db } = initFirebase();
+initFirebase();
 
-module.exports = { admin, db, initFirebase };
+module.exports = { admin, initFirebase };
