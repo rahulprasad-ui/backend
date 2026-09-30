@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: rivava-backend-api
+    runtime: node
+    rootDir: backend
+    buildCommand: npm install
+    startCommand: npm start
+    plan: free
+    region: singapore
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: CORS_ORIGIN
+        value: "*"
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_FROM_EMAIL
+        value: Rivava TrackFi <onboarding@resend.dev>
+      - key: FIREBASE_PROJECT_ID
+        value: rivavatrackfi

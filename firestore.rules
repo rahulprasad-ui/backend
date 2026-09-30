@@ -1,0 +1,76 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    match /therivavadata/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+
+    match /therivdata/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+
+    match /THEDATA/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+
+
+    match /users/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+
+      match /transactions/{transactionId} {
+        allow read, delete: if request.auth != null && request.auth.uid == userId;
+        allow create, update: if request.auth != null
+          && request.auth.uid == userId
+          && request.resource.data.userId == userId
+          && request.resource.data.amount is number
+          && request.resource.data.amount >= 0
+          && request.resource.data.type in ["CREDIT", "DEBIT", "INCOME", "EXPENSE", "REWARD", "BILL_PENDING", "MANDATE_CREATED", "SELF_TRANSFER", "IGNORE", "SUB"]
+          && request.resource.data.title is string
+          && request.resource.data.date is number;
+      }
+
+      match /subscription/{document} {
+        allow read: if request.auth != null && request.auth.uid == userId;
+        allow write: if false; // Only backend can write to subscriptions
+      }
+    }
+
+    match /payments/{docId} {
+      // Allow users to read their own payment records.
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+
+      // Clients cannot write to payment records directly; must be via Cloud Functions.
+      allow write: if false;
+    }
+
+    match /elite_membership_meta/{document} {
+      allow read: if request.auth != null;
+      allow write: if false; // Backend only
+    }
+
+    match /elite_sessions/{sessionId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.uid;
+      allow write: if false; // Backend/Admin only
+    }
+
+    match /elite_slots/{slotId} {
+      allow read: if request.auth != null;
+      allow write: if false; // Admin only
+    }
+
+    match /elite_payment_events/{document} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.uid;
+      allow write: if false; // Backend only
+    }
+
+    match /otps/{phone} {
+      allow read, write: if false; // Node.js Backend only via Admin SDK
+    }
+
+    match /secret_keys/{keyId} {
+      allow read, write: if false; // Backend only via Admin SDK - Protected from client reverse engineering
+    }
+  }
+}
