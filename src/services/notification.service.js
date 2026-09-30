@@ -1,38 +1,29 @@
 const { admin } = require('../config/firebase');
-const db = require('../config/database');
 const logger = require('../utils/logger');
 
 class NotificationService {
   /**
-   * Registers or updates a device FCM token for a user.
+   * Registers or updates a device FCM token for a user in Firebase Firestore.
    */
   static async registerToken(userId, token, device = 'Android') {
     if (!userId || !token) return false;
     const now = Date.now();
-    await db.execute({
-      sql: `
-        INSERT INTO fcm_tokens (user_id, token, device, updated_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(token) DO UPDATE SET
-          user_id = excluded.user_id,
-          device = excluded.device,
-          updated_at = excluded.updated_at
-      `,
-      args: [userId, token, device, now]
+    await admin.firestore().collection('fcm_tokens').doc(token).set({
+      userId,
+      token,
+      device,
+      updatedAt: now
     });
-    logger.info(`FCM token registered in Turso for user: ${userId}`);
+    logger.info(`FCM token registered in Firebase Firestore for user: ${userId}`);
     return true;
   }
 
   /**
-   * Removes an FCM token.
+   * Removes an FCM token from Firestore.
    */
   static async unregisterToken(token) {
     if (!token) return false;
-    await db.execute({
-      sql: 'DELETE FROM fcm_tokens WHERE token = ?',
-      args: [token]
-    });
+    await admin.firestore().collection('fcm_tokens').doc(token).delete().catch(() => {});
     return true;
   }
 
@@ -42,18 +33,14 @@ class NotificationService {
   static async sendToUser(userId, { title, body, data = {} }) {
     if (!userId || !title) return false;
 
-    const result = await db.execute({
-      sql: 'SELECT token FROM fcm_tokens WHERE user_id = ?',
-      args: [userId]
-    });
-    const tokens = result.rows;
+    const snap = await admin.firestore().collection('fcm_tokens').where('userId', '==', userId).get();
 
-    if (!tokens || tokens.length === 0) {
-      logger.info(`No active FCM tokens found in Turso for user: ${userId}`);
+    if (snap.empty) {
+      logger.info(`No active FCM tokens found in Firestore for user: ${userId}`);
       return false;
     }
 
-    const registrationTokens = tokens.map(t => t.token);
+    const registrationTokens = snap.docs.map(d => d.data().token);
 
     const message = {
       notification: {
@@ -79,17 +66,15 @@ class NotificationService {
               const errorCode = resp.error?.code;
               if (errorCode === 'messaging/invalid-registration-token' ||
                   errorCode === 'messaging/registration-token-not-registered') {
-                await db.execute({ sql: 'DELETE FROM fcm_tokens WHERE token = ?', args: [badToken] }).catch(() => {});
-                logger.warn(`Removed dead FCM token from Turso: ${badToken}`);
+                await admin.firestore().collection('fcm_tokens').doc(badToken).delete().catch(() => {});
+                logger.warn(`Removed invalid FCM token from Firestore: ${badToken}`);
               }
             }
           });
         }
         return true;
-      } else {
-        logger.warn('[FCM] Firebase messaging not initialized. Notification skipped.');
-        return false;
       }
+      return false;
     } catch (error) {
       logger.error(`Error sending FCM push notification to ${userId}:`, error.message);
       return false;
@@ -99,20 +84,24 @@ class NotificationService {
   /**
    * Broadcast push notification to topic.
    */
-  static async sendTopic(topic, { title, body, data = {} }) {
+  static async sendToTopic(topic, { title, body, data = {} }) {
     if (!topic || !title) return false;
+
+    const message = {
+      notification: { title, body },
+      data,
+      topic
+    };
+
     try {
       if (admin && admin.messaging) {
-        await admin.messaging().send({
-          topic,
-          notification: { title, body },
-          data
-        });
-        logger.info(`Broadcast FCM notification sent to topic: ${topic}`);
+        const response = await admin.messaging().send(message);
+        logger.info(`FCM Broadcast to topic ${topic} successful: ${response}`);
         return true;
       }
+      return false;
     } catch (error) {
-      logger.error(`Failed to send topic notification to ${topic}:`, error.message);
+      logger.error(`Error broadcasting to topic ${topic}:`, error.message);
       return false;
     }
   }

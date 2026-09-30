@@ -1,19 +1,21 @@
 const crypto = require('crypto');
-const { admin, db } = require('../config/firebase');
+const { admin, initFirebase } = require('../config/firebase');
 const EmailService = require('./email.service');
 const ApiError = require('../utils/apiError');
 const logger = require('../utils/logger');
 
+initFirebase();
+
 class VerificationService {
   /**
-   * Generates and dispatches an email verification token.
-   * Rate limits to 1 email every 60 seconds per UID.
+   * Generates and dispatches an email verification token in Firestore.
    */
   static async sendVerificationEmail(uid, email) {
     if (!uid || !email) {
       throw ApiError.badRequest('Missing email or user ID.');
     }
 
+    const db = admin.firestore();
     const verificationRef = db.collection('email_verifications').doc(uid);
     const token = crypto.randomBytes(32).toString('hex');
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
@@ -26,7 +28,7 @@ class VerificationService {
       if (existingDoc.exists) {
         const data = existingDoc.data();
         const now = new Date();
-        const createdAt = data.createdAt ? data.createdAt.toDate() : new Date(0);
+        const createdAt = data.createdAt ? (data.createdAt.toDate ? data.createdAt.toDate() : new Date(data.createdAt)) : new Date(0);
         const diffSeconds = (now.getTime() - createdAt.getTime()) / 1000;
 
         if (diffSeconds < 60) {
@@ -39,7 +41,7 @@ class VerificationService {
         email,
         tokenHash,
         expiresAt,
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
+        createdAt: new Date()
       });
     });
 
@@ -56,13 +58,14 @@ class VerificationService {
   }
 
   /**
-   * Verifies an email token and marks user profile as verified.
+   * Verifies an email token and marks user profile as verified in Firestore.
    */
   static async verifyToken(token) {
     if (!token) {
       throw ApiError.badRequest('Missing verification token.');
     }
 
+    const db = admin.firestore();
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
     const snapshot = await db.collection('email_verifications')
       .where('tokenHash', '==', tokenHash)
@@ -76,24 +79,34 @@ class VerificationService {
     const doc = snapshot.docs[0];
     const data = doc.data();
 
-    if (data.expiresAt && data.expiresAt.toDate() < new Date()) {
+    const exp = data.expiresAt ? (data.expiresAt.toDate ? data.expiresAt.toDate() : new Date(data.expiresAt)) : new Date();
+    if (exp < new Date()) {
       await doc.ref.delete().catch(() => {});
       throw ApiError.badRequest('Verification token has expired.');
     }
 
-    // Mark user verified in Firestore
+    // Mark user verified in Firestore therivdata and users
+    await db.collection('therivdata').doc(data.uid).set({
+      isVerified: true,
+      email_verified: true,
+      email: data.email,
+      updatedAt: Date.now()
+    }, { merge: true });
+
     await db.collection('users').doc(data.uid).set({
       isVerified: true,
       email_verified: true,
       email: data.email,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      updatedAt: Date.now()
     }, { merge: true });
 
     // Update Firebase Auth user
     try {
-      await admin.auth().updateUser(data.uid, {
-        emailVerified: true
-      });
+      if (admin && admin.auth) {
+        await admin.auth().updateUser(data.uid, {
+          emailVerified: true
+        });
+      }
     } catch (authErr) {
       logger.warn(`Could not update emailVerified in Firebase Auth: ${authErr.message}`);
     }
@@ -101,7 +114,7 @@ class VerificationService {
     // Clean up verification token
     await doc.ref.delete().catch(() => {});
 
-    // Send Welcome Email if not sent
+    // Send Welcome Email
     await EmailService.sendWelcomeEmail(data.email, '').catch(() => {});
 
     return {
@@ -113,16 +126,26 @@ class VerificationService {
   }
 
   /**
-   * Checks current verification status of a user
+   * Checks current verification status of a user in Firestore
    */
   static async checkStatus(uid) {
     if (!uid) {
       throw ApiError.badRequest('User ID is required.');
     }
 
-    const userDoc = await db.collection('users').doc(uid).get();
+    const db = admin.firestore();
+    const userDoc = await db.collection('therivdata').doc(uid).get();
     if (!userDoc.exists) {
-      throw ApiError.notFound('User record not found.');
+      const fallbackDoc = await db.collection('users').doc(uid).get();
+      if (!fallbackDoc.exists) {
+        throw ApiError.notFound('User record not found.');
+      }
+      const userData = fallbackDoc.data() || {};
+      return {
+        uid,
+        isVerified: userData.isVerified === true || userData.email_verified === true,
+        email: userData.email || null
+      };
     }
 
     const userData = userDoc.data() || {};
