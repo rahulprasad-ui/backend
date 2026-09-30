@@ -39,6 +39,8 @@ pids/
 *.pid.lock
 .temp/
 temp_*.bat
+data/*.sqlite*
+data/*.db*
 
 # IDE & Editor files
 .idea/

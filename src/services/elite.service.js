@@ -1,12 +1,13 @@
-const { admin, db } = require('../config/firebase');
+const db = require('../config/database');
 const ApiError = require('../utils/apiError');
 const logger = require('../utils/logger');
+const NotificationService = require('./notification.service');
 
 class EliteService {
   /**
-   * Creates an Elite / Premium payment order in Firestore
+   * Creates an Elite payment order in SQLite.
    * @param {string} uid User ID
-   * @param {number} amount Amount in paise (e.g. 330000 = Rs. 3300)
+   * @param {number} amount Amount in paise
    * @param {string} [plan='elite_3300']
    */
   static async createOrder(uid, amount, plan = 'elite_3300') {
@@ -15,135 +16,92 @@ class EliteService {
     }
 
     const orderId = `elite_order_${uid}_${Date.now()}`;
-    const paymentRef = db.collection('elite_payment_events').doc();
+    const amountInRupees = amount ? amount / 100 : 3300;
+    const now = Date.now();
 
-    const orderRecord = {
-      uid,
-      orderId,
-      amount: amount ? amount / 100 : 3300,
-      currency: 'INR',
-      status: 'created',
-      plan,
-      rawEventType: 'created',
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      verifiedAt: null
-    };
+    const stmt = db.prepare(`
+      INSERT INTO payments (order_id, user_id, plan, amount, amount_paise, currency, status, gateway_provider, created_at)
+      VALUES (?, ?, ?, ?, ?, 'INR', 'created', 'razorpay', ?)
+    `);
+    stmt.run(orderId, uid, plan, amountInRupees, amount || 330000, now);
 
-    await paymentRef.set(orderRecord);
-    logger.info(`Elite order created: ${orderId} for UID: ${uid}`);
+    logger.info(`Elite order created in SQLite: ${orderId} for UID: ${uid}`);
 
     return {
       orderId,
-      amount: orderRecord.amount,
+      amount: amountInRupees,
       currency: 'INR',
-      paymentUrl: `https://mock-uropay.example.com/pay/${orderId}`
+      paymentUrl: `https://backend-6fey.onrender.com/pay/${orderId}`
     };
   }
 
   /**
-   * Verifies payment and activates user Elite subscription inside an atomic Firestore transaction.
+   * Verifies payment and activates user Elite subscription inside an atomic SQLite transaction.
    */
   static async verifyPayment(uid, orderId) {
     if (!uid || !orderId) {
       throw ApiError.badRequest('User ID and Order ID are required.');
     }
 
-    const result = await db.runTransaction(async (transaction) => {
-      // Find matching payment document
-      const paymentsQuery = db.collection('elite_payment_events')
-        .where('orderId', '==', orderId)
-        .where('uid', '==', uid)
-        .limit(1);
+    const now = Date.now();
+    const nextBilling = now + 30 * 24 * 60 * 60 * 1000;
 
-      const paymentsSnapshot = await transaction.get(paymentsQuery);
+    const verifyTx = db.transaction(() => {
+      const order = db.prepare(`SELECT * FROM payments WHERE order_id = ? AND user_id = ?`).get(orderId, uid);
 
-      if (paymentsSnapshot.empty) {
+      if (!order) {
         throw ApiError.notFound('Payment order record not found.');
       }
 
-      const paymentDoc = paymentsSnapshot.docs[0];
-      const paymentData = paymentDoc.data();
-
-      if (paymentData.status === 'success') {
-        return { success: true, isElite: true, message: 'Payment has already been processed and verified.' };
+      if (order.status === 'success') {
+        return { success: true, isElite: true, message: 'Payment has already been processed.' };
       }
 
-      // Check Elite membership seat configuration
-      const configRef = db.collection('elite_membership_meta').doc('config');
-      const configDoc = await transaction.get(configRef);
-
-      let occupiedSeats = 0;
-      let totalSeats = 100;
-
-      if (configDoc.exists) {
-        const configData = configDoc.data();
-        occupiedSeats = configData.occupiedSeats || 0;
-        totalSeats = configData.totalSeats || 100;
-      } else {
-        transaction.set(configRef, {
-          totalSeats: 100,
-          occupiedSeats: 0,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-      }
-
-      if (occupiedSeats >= totalSeats) {
-        transaction.update(paymentDoc.ref, {
-          status: 'failed_limit_reached',
-          rawEventType: 'failed_limit_reached',
-          updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-        throw ApiError.badRequest('Elite Membership cohort is currently full.');
-      }
-
-      // Increment occupied seats
-      transaction.update(configRef, {
-        occupiedSeats: admin.firestore.FieldValue.increment(1),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-
-      // Update payment document to success
       const paymentId = `txn_${Date.now()}`;
-      transaction.update(paymentDoc.ref, {
-        status: 'success',
-        paymentId,
-        verifiedAt: admin.firestore.FieldValue.serverTimestamp(),
-        rawEventType: 'success'
-      });
 
-      // Update user subscription
-      const subscriptionRef = db.collection('users').doc(uid).collection('subscription').doc('current');
-      const now = new Date();
-      const nextBilling = new Date(now);
-      nextBilling.setMonth(now.getMonth() + 1);
+      // Update payment record
+      db.prepare(`
+        UPDATE payments SET status = 'success', payment_id = ?, verified_at = ? WHERE order_id = ?
+      `).run(paymentId, now, orderId);
 
-      transaction.set(subscriptionRef, {
-        isElite: true,
-        plan: 'elite_3300',
-        startedAt: admin.firestore.FieldValue.serverTimestamp(),
-        expiresAt: admin.firestore.Timestamp.fromDate(nextBilling),
-        minutesRemaining: 600,
-        monthlyMinutes: 600,
-        autoRenew: true,
-        paymentStatus: 'active',
-        mandateId: `mandate_${uid}`,
-        recurringStatus: 'active',
-        nextBillingDate: admin.firestore.Timestamp.fromDate(nextBilling),
-        lastPaymentId: paymentId,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp()
-      }, { merge: true });
+      // Update elite subscription
+      db.prepare(`
+        INSERT INTO elite_subscriptions (user_id, is_elite, plan, minutes_remaining, monthly_minutes, auto_renew, next_billing_date, payment_status, updated_at)
+        VALUES (?, 1, ?, 600, 600, 1, ?, 'active', ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+          is_elite = 1,
+          plan = excluded.plan,
+          minutes_remaining = 600,
+          monthly_minutes = 600,
+          auto_renew = 1,
+          next_billing_date = excluded.next_billing_date,
+          payment_status = 'active',
+          updated_at = excluded.updated_at
+      `).run(uid, order.plan || 'elite_3300', nextBilling, now);
+
+      // Update user premium status
+      db.prepare(`
+        UPDATE users SET is_premium = 1, premium_status = 'active', premium_plan = 'elite', updated_at = ? WHERE id = ?
+      `).run(now, uid);
 
       return {
         success: true,
         isElite: true,
-        plan: 'elite_3300',
-        expiresAt: nextBilling.toISOString(),
+        plan: order.plan || 'elite_3300',
+        expiresAt: new Date(nextBilling).toISOString(),
         minutesRemaining: 600
       };
     });
 
-    logger.info(`Elite payment verified for user ${uid}, order: ${orderId}`);
+    const result = verifyTx();
+
+    NotificationService.sendToUser(uid, {
+      title: '👑 Welcome to Elite Club!',
+      body: 'Your Elite Membership is now active. Enjoy priority advisory and exclusive perks.',
+      data: { type: 'ELITE_ACTIVATED', orderId }
+    }).catch(() => {});
+
+    logger.info(`Elite payment verified in SQLite for user ${uid}, order: ${orderId}`);
     return result;
   }
 
@@ -162,58 +120,46 @@ class EliteService {
     }
 
     const numDuration = Number(duration);
+    const dateMillis = typeof date === 'number' ? date : new Date(date).getTime();
+    const sessionId = `session_${uid}_${Date.now()}`;
+    const now = Date.now();
 
-    const result = await db.runTransaction(async (transaction) => {
-      const subscriptionRef = db.collection('users').doc(uid).collection('subscription').doc('current');
-      const subscriptionDoc = await transaction.get(subscriptionRef);
+    const bookTx = db.transaction(() => {
+      const sub = db.prepare(`SELECT * FROM elite_subscriptions WHERE user_id = ?`).get(uid);
 
-      if (!subscriptionDoc.exists) {
-        throw ApiError.badRequest('No active Elite subscription found.');
-      }
-
-      const subscriptionData = subscriptionDoc.data();
-      if (!subscriptionData.isElite || subscriptionData.paymentStatus !== 'active') {
+      if (!sub || !sub.is_elite || sub.payment_status !== 'active') {
         throw ApiError.badRequest('Your Elite subscription is not active.');
       }
 
-      if ((subscriptionData.minutesRemaining || 0) < numDuration) {
-        throw ApiError.badRequest(`Insufficient minutes. You have ${subscriptionData.minutesRemaining || 0} minutes available.`);
+      if (sub.minutes_remaining < numDuration) {
+        throw ApiError.badRequest(`Insufficient minutes. You have ${sub.minutes_remaining} minutes available.`);
       }
 
-      // Deduct minutes
-      transaction.update(subscriptionRef, {
-        minutesRemaining: admin.firestore.FieldValue.increment(-numDuration),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp()
-      });
+      const newMinutes = sub.minutes_remaining - numDuration;
+      db.prepare(`UPDATE elite_subscriptions SET minutes_remaining = ?, updated_at = ? WHERE user_id = ?`).run(newMinutes, now, uid);
 
-      // Create booking document
-      const sessionRef = db.collection('elite_sessions').doc();
-      const sessionDate = typeof date === 'number' ? admin.firestore.Timestamp.fromMillis(date) : admin.firestore.Timestamp.fromDate(new Date(date));
-
-      transaction.set(sessionRef, {
-        uid,
-        selectedDate: sessionDate,
-        selectedTime: time,
-        slotId: slotId || `slot_${Date.now()}`,
-        status: 'pending',
-        minutesBooked: numDuration,
-        meetingLink: null,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        approvedAt: null,
-        completedAt: null,
-        cancelledAt: null
-      });
+      db.prepare(`
+        INSERT INTO elite_sessions (id, user_id, duration, date_millis, time_slot, status, created_at)
+        VALUES (?, ?, ?, ?, ?, 'booked', ?)
+      `).run(sessionId, uid, numDuration, dateMillis, time, now);
 
       return {
         success: true,
-        sessionId: sessionRef.id,
+        sessionId,
         minutesBooked: numDuration,
-        minutesRemaining: (subscriptionData.minutesRemaining || 0) - numDuration
+        minutesRemaining: newMinutes
       };
     });
 
-    logger.info(`Session booked for UID: ${uid}, session ID: ${result.sessionId}`);
+    const result = bookTx();
+
+    NotificationService.sendToUser(uid, {
+      title: '📅 Session Booked',
+      body: `Your ${numDuration}-minute advisor session is confirmed for ${time}.`,
+      data: { type: 'SESSION_BOOKED', sessionId }
+    }).catch(() => {});
+
+    logger.info(`Session booked in SQLite for UID: ${uid}, session ID: ${result.sessionId}`);
     return result;
   }
 
@@ -225,20 +171,16 @@ class EliteService {
       throw ApiError.badRequest('User ID is required.');
     }
 
-    const subscriptionRef = db.collection('users').doc(uid).collection('subscription').doc('current');
-    const docSnap = await subscriptionRef.get();
+    const now = Date.now();
+    const result = db.prepare(`
+      UPDATE elite_subscriptions SET auto_renew = 0, updated_at = ? WHERE user_id = ?
+    `).run(now, uid);
 
-    if (!docSnap.exists) {
+    if (result.changes === 0) {
       throw ApiError.notFound('No subscription found to cancel.');
     }
 
-    await subscriptionRef.update({
-      autoRenew: false,
-      recurringStatus: 'cancelled',
-      updatedAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    logger.info(`Subscription cancelled for user: ${uid}`);
+    logger.info(`Subscription auto-renew cancelled in SQLite for user: ${uid}`);
     return { success: true, message: 'Subscription auto-renew cancelled successfully.' };
   }
 
@@ -250,10 +192,9 @@ class EliteService {
       throw ApiError.badRequest('User ID is required.');
     }
 
-    const subscriptionRef = db.collection('users').doc(uid).collection('subscription').doc('current');
-    const docSnap = await subscriptionRef.get();
+    const sub = db.prepare(`SELECT * FROM elite_subscriptions WHERE user_id = ?`).get(uid);
 
-    if (!docSnap.exists) {
+    if (!sub) {
       return {
         isElite: false,
         plan: 'free',
@@ -261,7 +202,15 @@ class EliteService {
       };
     }
 
-    return docSnap.data();
+    return {
+      isElite: Boolean(sub.is_elite),
+      plan: sub.plan,
+      minutesRemaining: sub.minutes_remaining,
+      monthlyMinutes: sub.monthly_minutes,
+      autoRenew: Boolean(sub.auto_renew),
+      nextBillingDate: sub.next_billing_date,
+      paymentStatus: sub.payment_status
+    };
   }
 }
 

@@ -6,6 +6,7 @@ const eliteRoutes = require('./elite.routes');
 const userRoutes = require('./user.routes');
 const secretKeyRoutes = require('./secretKey.routes');
 const paymentRoutes = require('./payment.routes');
+const notificationRoutes = require('./notification.routes');
 
 const router = express.Router();
 
@@ -17,5 +18,6 @@ router.use('/elite', eliteRoutes);
 router.use('/payments', paymentRoutes);
 router.use('/users', userRoutes);
 router.use('/keys', secretKeyRoutes);
+router.use('/notifications', notificationRoutes);
 
 module.exports = router;

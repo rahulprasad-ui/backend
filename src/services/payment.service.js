@@ -1,12 +1,13 @@
 const crypto = require('crypto');
-const { db, admin } = require('../config/firebase');
+const db = require('../config/database');
 const config = require('../config/env');
 const logger = require('../utils/logger');
 const ApiError = require('../utils/apiError');
+const NotificationService = require('./notification.service');
 
 class PaymentService {
   /**
-   * Generates a cryptographically secure HMAC signature for Razorpay / payment verification.
+   * Generates a cryptographically secure HMAC signature for Razorpay verification.
    */
   static generateSignature(orderId, paymentId, secret = config.paymentGateway.keySecret) {
     return crypto
@@ -16,7 +17,7 @@ class PaymentService {
   }
 
   /**
-   * Constant-time comparison to prevent timing attack vulnerabilities.
+   * Constant-time comparison to prevent timing attacks.
    */
   static verifySignature(orderId, paymentId, signature, secret = config.paymentGateway.keySecret) {
     if (!orderId || !paymentId || !signature) return false;
@@ -37,7 +38,7 @@ class PaymentService {
   }
 
   /**
-   * Initiates and registers a new payment order securely on the backend.
+   * Initiates and registers a new payment order securely in SQLite.
    */
   static async createOrder({ userId, userEmail = null, plan = 'portfolio_premium', amountPaise = 1100 }) {
     if (!userId) {
@@ -47,28 +48,16 @@ class PaymentService {
     const numAmountPaise = Math.max(100, Number(amountPaise) || 1100);
     const amountInRupees = numAmountPaise / 100;
     const orderId = `order_${userId.substring(0, 8)}_${Date.now()}`;
-    const keyRef = db.collection('payments').doc(orderId);
+    const now = Date.now();
 
-    const paymentRecord = {
-      orderId,
-      userId,
-      userEmail,
-      plan,
-      amount: amountInRupees,
-      amountPaise: numAmountPaise,
-      currency: config.paymentGateway.currency,
-      status: 'created',
-      gatewayProvider: config.paymentGateway.provider,
-      paymentId: null,
-      signature: null,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      verifiedAt: null
-    };
+    const stmt = db.prepare(`
+      INSERT INTO payments (order_id, user_id, user_email, plan, amount, amount_paise, currency, status, gateway_provider, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'created', 'razorpay', ?)
+    `);
+    stmt.run(orderId, userId, userEmail, plan, amountInRupees, numAmountPaise, config.paymentGateway.currency, now);
 
-    await keyRef.set(paymentRecord);
-    logger.info(`Payment order created: ${orderId} for User: ${userId} (Amount: Rs. ${amountInRupees}, Plan: ${plan})`);
+    logger.info(`Payment order created: ${orderId} in SQLite (Amount: Rs. ${amountInRupees}, Plan: ${plan})`);
 
-    // Generate secure mock payment URL or Razorpay checkout params
     const paymentUrl = `${config.baseUrl}/pay/${orderId}`;
 
     return {
@@ -88,14 +77,13 @@ class PaymentService {
 
   /**
    * Server-Side Payment Verification:
-   * Validates signature and updates user's premium entitlement atomically.
+   * Validates signature and updates user's premium entitlement in SQLite atomically.
    */
   static async verifyPayment({ userId, orderId, paymentId, signature }) {
     if (!userId || !orderId) {
       throw ApiError.badRequest('User ID and Order ID are required.');
     }
 
-    // In production with gateway signature, verify HMAC
     const isMock = config.env !== 'production' && (!signature || signature.startsWith('mock_'));
     const isSignatureValid = isMock ? true : this.verifySignature(orderId, paymentId, signature);
 
@@ -106,75 +94,74 @@ class PaymentService {
 
     const assignedPaymentId = paymentId || `txn_${Date.now()}`;
     const assignedSignature = signature || this.generateSignature(orderId, assignedPaymentId);
+    const now = Date.now();
 
-    const result = await db.runTransaction(async (transaction) => {
-      const orderRef = db.collection('payments').doc(orderId);
-      const orderDoc = await transaction.get(orderRef);
+    const verifyTransaction = db.transaction(() => {
+      const order = db.prepare(`SELECT * FROM payments WHERE order_id = ?`).get(orderId);
 
-      if (!orderDoc.exists) {
+      if (!order) {
         throw ApiError.notFound('Payment order record not found.');
       }
 
-      const orderData = orderDoc.data();
-
-      // Ensure order matches the authenticated user
-      if (orderData.userId !== userId) {
+      if (order.user_id !== userId) {
         throw ApiError.forbidden('Payment order does not belong to this user.');
       }
 
-      // Check if already processed
-      if (orderData.status === 'success') {
+      if (order.status === 'success') {
         return {
           success: true,
           isPremium: true,
           orderId,
-          paymentId: orderData.paymentId,
+          paymentId: order.payment_id,
           message: 'Payment has already been verified and processed.'
         };
       }
 
-      // Update payment record to success
-      transaction.update(orderRef, {
-        status: 'success',
-        paymentId: assignedPaymentId,
-        signature: assignedSignature,
-        verifiedAt: admin.firestore.FieldValue.serverTimestamp()
-      });
+      // Update payment record
+      db.prepare(`
+        UPDATE payments
+        SET status = 'success', payment_id = ?, signature = ?, verified_at = ?
+        WHERE order_id = ?
+      `).run(assignedPaymentId, assignedSignature, now, orderId);
 
-      // Update user document to grant premium entitlement
-      const userRef = db.collection('users').doc(userId);
-      transaction.set(userRef, {
-        is_premium: true,
-        premium_status: 'active',
-        premium_source: 'payment_gateway',
-        premium_plan: orderData.plan || 'portfolio_premium',
-        premium_unlocked_at: admin.firestore.FieldValue.serverTimestamp(),
-        last_payment_id: assignedPaymentId,
-        last_order_id: orderId
-      }, { merge: true });
-
-      // Update legacy tables for sync
-      const therivRef = db.collection('therivdata').doc(userId);
-      const therivavaRef = db.collection('therivavadata').doc(userId);
-      transaction.set(therivRef, { premiumStatus: true, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
-      transaction.set(therivavaRef, { premiumStatus: true, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+      // Update user premium status in SQLite
+      db.prepare(`
+        INSERT INTO users (id, is_premium, premium_status, premium_source, premium_plan, premium_unlocked_at, updated_at)
+        VALUES (?, 1, 'active', 'payment_gateway', ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          is_premium = 1,
+          premium_status = 'active',
+          premium_source = 'payment_gateway',
+          premium_plan = excluded.premium_plan,
+          premium_unlocked_at = excluded.premium_unlocked_at,
+          updated_at = excluded.updated_at
+      `).run(userId, order.plan || 'portfolio_premium', now, now);
 
       return {
         success: true,
         isPremium: true,
         orderId,
         paymentId: assignedPaymentId,
-        plan: orderData.plan || 'portfolio_premium',
+        plan: order.plan || 'portfolio_premium',
         message: 'Payment verified successfully. Premium access unlocked!'
       };
     });
 
-    logger.info(`Payment verified and premium unlocked for user: ${userId}, order: ${orderId}`);
+    const result = verifyTransaction();
+
+    // Send FCM Push Notification via Firebase
+    NotificationService.sendToUser(userId, {
+      title: '🎉 Premium Unlocked!',
+      body: 'Your payment was successful. Enjoy full access to Rivava TrackFi features.',
+      data: { type: 'PREMIUM_UNLOCKED', orderId }
+    }).catch(err => logger.warn(`FCM notification error: ${err.message}`));
+
+    logger.info(`Payment verified and premium unlocked in SQLite for user: ${userId}, order: ${orderId}`);
     return result;
   }
 
   /**
-   * Webhook event processor for asynchronous payment notifications from gateway.
+   * Webhook event processor for asynchronous Razorpay webhook notifications.
    */
   static async processWebhook({ rawBody, signatureHeader, eventPayload }) {
     if (signatureHeader && config.paymentGateway.webhookSecret) {
@@ -195,7 +182,7 @@ class PaymentService {
     }
 
     const event = eventPayload.event;
-    logger.info(`Payment gateway webhook received: ${event}`);
+    logger.info(`Razorpay webhook received: ${event}`);
 
     if (event === 'payment.captured' || event === 'order.paid') {
       const paymentEntity = eventPayload.payload?.payment?.entity || eventPayload.payment;
@@ -204,27 +191,32 @@ class PaymentService {
       const userId = paymentEntity?.notes?.userId || eventPayload.userId;
 
       if (orderId && userId) {
-        const orderRef = db.collection('payments').doc(orderId);
-        const orderDoc = await orderRef.get();
+        const now = Date.now();
+        const order = db.prepare(`SELECT * FROM payments WHERE order_id = ?`).get(orderId);
 
-        if (orderDoc.exists && orderDoc.data().status !== 'success') {
-          await orderRef.update({
-            status: 'success',
-            paymentId: paymentId || `webhook_${Date.now()}`,
-            verifiedVia: 'webhook',
-            verifiedAt: admin.firestore.FieldValue.serverTimestamp()
-          });
+        if (order && order.status !== 'success') {
+          db.prepare(`
+            UPDATE payments SET status = 'success', payment_id = ?, verified_at = ? WHERE order_id = ?
+          `).run(paymentId || `webhook_${now}`, now, orderId);
 
-          await db.collection('users').doc(userId).set({
-            is_premium: true,
-            premium_status: 'active',
-            premium_source: 'payment_webhook',
-            premium_unlocked_at: admin.firestore.FieldValue.serverTimestamp()
-          }, { merge: true });
+          db.prepare(`
+            INSERT INTO users (id, is_premium, premium_status, premium_source, premium_unlocked_at, updated_at)
+            VALUES (?, 1, 'active', 'payment_webhook', ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              is_premium = 1,
+              premium_status = 'active',
+              premium_source = 'payment_webhook',
+              premium_unlocked_at = excluded.premium_unlocked_at,
+              updated_at = excluded.updated_at
+          `).run(userId, now, now);
 
-          await db.collection('therivdata').doc(userId).set({ premiumStatus: true }, { merge: true });
-          await db.collection('therivavadata').doc(userId).set({ premiumStatus: true }, { merge: true });
-          logger.info(`Webhook successfully processed and unlocked premium for user: ${userId}`);
+          NotificationService.sendToUser(userId, {
+            title: '🎉 Premium Activated!',
+            body: 'Your payment was processed successfully.',
+            data: { type: 'PREMIUM_ACTIVATED', orderId }
+          }).catch(() => {});
+
+          logger.info(`Webhook successfully processed in SQLite for user: ${userId}`);
         }
       }
     }
@@ -237,13 +229,9 @@ class PaymentService {
    */
   static async getPaymentsByUser(userId) {
     if (!userId) throw ApiError.badRequest('User ID is required.');
-    const snapshot = await db.collection('payments')
-      .where('userId', '==', userId)
-      .orderBy('createdAt', 'desc')
-      .limit(20)
-      .get();
-
-    return snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    return db.prepare(`
+      SELECT * FROM payments WHERE user_id = ? ORDER BY created_at DESC LIMIT 20
+    `).all(userId);
   }
 }
 

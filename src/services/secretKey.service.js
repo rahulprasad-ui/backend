@@ -1,6 +1,7 @@
 const crypto = require('crypto');
-const { db, admin } = require('../config/firebase');
+const db = require('../config/database');
 const logger = require('../utils/logger');
+const NotificationService = require('./notification.service');
 
 // Charset without ambiguous characters (no 0, O, 1, I, L)
 const KEY_CHARSET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
@@ -37,10 +38,10 @@ class SecretKeyService {
   }
 
   /**
-   * Generates and stores new secure keys in Firestore.
+   * Generates and stores new secure keys in SQLite.
    */
   static async createSecretKey({
-    tier = 'portfolio_premium', // 'portfolio_premium' | 'elite_pro' | 'lifetime'
+    tier = 'portfolio_premium',
     maxUses = 1,
     prefix = 'RIV',
     assignedEmail = null,
@@ -49,40 +50,28 @@ class SecretKeyService {
     createdBy = 'system_admin'
   } = {}) {
     const rawKey = this.generateRandomKeyString(prefix);
-    const keyId = crypto.createHash('sha256').update(rawKey).digest('hex');
+    const now = Date.now();
+    const expiresAt = expiresInDays ? (now + expiresInDays * 24 * 60 * 60 * 1000) : null;
+    const cleanEmail = assignedEmail ? assignedEmail.toLowerCase().trim() : null;
 
-    const keyData = {
-      key: rawKey,
-      keyId,
-      tier,
-      maxUses: Number(maxUses) || 1,
-      useCount: 0,
-      status: 'active', // 'active' | 'redeemed' | 'revoked' | 'expired'
-      isRevoked: false,
-      revokedReason: null,
-      assignedEmail: assignedEmail ? assignedEmail.toLowerCase().trim() : null,
-      redeemedBy: [],
-      notes,
-      createdBy,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      expiresAt: expiresInDays ? new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000) : null
-    };
+    const stmt = db.prepare(`
+      INSERT INTO secret_keys (key_string, tier, max_uses, current_uses, assigned_email, expires_at, notes, created_by, is_active, created_at)
+      VALUES (?, ?, ?, 0, ?, ?, ?, ?, 1, ?)
+    `);
+    stmt.run(rawKey, tier, Number(maxUses) || 1, cleanEmail, expiresAt, notes, createdBy, now);
 
-    await db.collection('secret_keys').doc(keyId).set(keyData);
-    logger.info(`Secure Secret Key created: ${rawKey.substring(0, 8)}... (Tier: ${tier}, MaxUses: ${maxUses})`);
+    logger.info(`Secure Secret Key created in SQLite: ${rawKey.substring(0, 8)}... (Tier: ${tier}, MaxUses: ${maxUses})`);
 
     return {
       key: rawKey,
-      keyId,
       tier,
-      maxUses: keyData.maxUses,
-      status: keyData.status,
-      expiresAt: keyData.expiresAt
+      maxUses: Number(maxUses) || 1,
+      expiresAt
     };
   }
 
   /**
-   * Atomically verifies and redeems a secret key for a specific user.
+   * Atomically verifies and redeems a secret key for a specific user in SQLite.
    */
   static async verifyAndRedeemKey({ keyString, userId, userEmail }) {
     if (!keyString || !keyString.trim()) {
@@ -94,14 +83,13 @@ class SecretKeyService {
     }
 
     const normalizedKey = this.normalizeKey(keyString);
-    const keyId = crypto.createHash('sha256').update(normalizedKey).digest('hex');
-    const keyRef = db.collection('secret_keys').doc(keyId);
+    const now = Date.now();
 
     try {
-      const result = await db.runTransaction(async (transaction) => {
-        const keyDoc = await transaction.get(keyRef);
+      const redeemTx = db.transaction(() => {
+        const keyRecord = db.prepare(`SELECT * FROM secret_keys WHERE key_string = ?`).get(normalizedKey);
 
-        if (!keyDoc.exists) {
+        if (!keyRecord) {
           return {
             success: false,
             code: 'INVALID_KEY',
@@ -109,33 +97,24 @@ class SecretKeyService {
           };
         }
 
-        const data = keyDoc.data();
-
-        // Check if revoked
-        if (data.isRevoked || data.status === 'revoked') {
+        if (!keyRecord.is_active) {
           return {
             success: false,
             code: 'KEY_REVOKED',
-            message: data.revokedReason ? `Key revoked: ${data.revokedReason}` : 'This key has been revoked by an administrator.'
+            message: 'This key has been revoked or deactivated.'
           };
         }
 
-        // Check expiry
-        if (data.expiresAt) {
-          const expiryDate = data.expiresAt.toDate ? data.expiresAt.toDate() : new Date(data.expiresAt);
-          if (new Date() > expiryDate) {
-            transaction.update(keyRef, { status: 'expired' });
-            return {
-              success: false,
-              code: 'KEY_EXPIRED',
-              message: 'This secret key has expired.'
-            };
-          }
+        if (keyRecord.expires_at && now > keyRecord.expires_at) {
+          return {
+            success: false,
+            code: 'KEY_EXPIRED',
+            message: 'This secret key has expired.'
+          };
         }
 
-        // Check email assignment if restricted
-        if (data.assignedEmail && userEmail) {
-          if (data.assignedEmail.toLowerCase() !== userEmail.toLowerCase()) {
+        if (keyRecord.assigned_email && userEmail) {
+          if (keyRecord.assigned_email.toLowerCase() !== userEmail.toLowerCase()) {
             return {
               success: false,
               code: 'EMAIL_MISMATCH',
@@ -144,22 +123,19 @@ class SecretKeyService {
           }
         }
 
-        // Check redemption count
-        const currentUses = data.useCount || 0;
-        const maxUses = data.maxUses || 1;
-
-        if (currentUses >= maxUses || data.status === 'redeemed') {
+        if (keyRecord.current_uses >= keyRecord.max_uses) {
           return {
             success: false,
             code: 'ALREADY_REDEEMED',
-            message: 'This secret key has already been redeemed and reached maximum uses.'
+            message: 'This secret key has reached its maximum uses.'
           };
         }
 
-        // Check if this specific user already redeemed this key
-        const redeemedList = data.redeemedBy || [];
-        const alreadyRedeemedByUser = redeemedList.some(r => r.userId === userId);
-        if (alreadyRedeemedByUser) {
+        const existingClaim = db.prepare(`
+          SELECT * FROM secret_key_redemptions WHERE key_string = ? AND user_id = ?
+        `).get(normalizedKey, userId);
+
+        if (existingClaim) {
           return {
             success: false,
             code: 'ALREADY_CLAIMED_BY_USER',
@@ -167,50 +143,49 @@ class SecretKeyService {
           };
         }
 
-        // Key is valid - apply redemption updates
-        const newUseCount = currentUses + 1;
-        const newStatus = newUseCount >= maxUses ? 'redeemed' : 'active';
-        const redemptionEntry = {
-          userId,
-          userEmail: userEmail || null,
-          redeemedAt: new Date().toISOString()
-        };
+        // Apply redemption
+        const newUses = keyRecord.current_uses + 1;
+        db.prepare(`UPDATE secret_keys SET current_uses = ? WHERE key_string = ?`).run(newUses, normalizedKey);
 
-        transaction.update(keyRef, {
-          useCount: newUseCount,
-          status: newStatus,
-          redeemedBy: admin.firestore.FieldValue.arrayUnion(redemptionEntry),
-          lastRedeemedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
+        db.prepare(`
+          INSERT INTO secret_key_redemptions (key_string, user_id, user_email, redeemed_at)
+          VALUES (?, ?, ?, ?)
+        `).run(normalizedKey, userId, userEmail || null, now);
 
-        // Update User Entitlements in Firestore
-        const userRef = db.collection('users').doc(userId);
-        transaction.set(userRef, {
-          is_premium: true,
-          premium_status: 'active',
-          premium_source: 'secret_key',
-          premium_tier: data.tier || 'portfolio_premium',
-          premium_unlocked_at: admin.firestore.FieldValue.serverTimestamp(),
-          unlocked_key_id: keyId
-        }, { merge: true });
-
-        // Update legacy collections for backward compatibility
-        const therivRef = db.collection('therivdata').doc(userId);
-        const therivavaRef = db.collection('therivavadata').doc(userId);
-        transaction.set(therivRef, { premiumStatus: true, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
-        transaction.set(therivavaRef, { premiumStatus: true, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+        // Update User Entitlement in SQLite
+        db.prepare(`
+          INSERT INTO users (id, is_premium, premium_status, premium_source, premium_plan, premium_unlocked_at, updated_at)
+          VALUES (?, 1, 'active', 'secret_key', ?, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET
+            is_premium = 1,
+            premium_status = 'active',
+            premium_source = 'secret_key',
+            premium_plan = excluded.premium_plan,
+            premium_unlocked_at = excluded.premium_unlocked_at,
+            updated_at = excluded.updated_at
+        `).run(userId, keyRecord.tier || 'portfolio_premium', now, now);
 
         return {
           success: true,
           code: 'SUCCESS',
-          tier: data.tier || 'portfolio_premium',
+          tier: keyRecord.tier || 'portfolio_premium',
           message: 'Premium access successfully unlocked!'
         };
       });
 
+      const result = redeemTx();
+
+      if (result.success) {
+        NotificationService.sendToUser(userId, {
+          title: '🎉 Secret Key Activated!',
+          body: `Your account has been upgraded to ${result.tier.toUpperCase()} tier.`,
+          data: { type: 'KEY_REDEEMED', tier: result.tier }
+        }).catch(() => {});
+      }
+
       return result;
     } catch (error) {
-      logger.error('Error during key redemption transaction:', error);
+      logger.error('Error during key redemption in SQLite:', error);
       return {
         success: false,
         code: 'TRANSACTION_ERROR',
@@ -222,41 +197,10 @@ class SecretKeyService {
   /**
    * Revoke a key or revoke a user's entitlement.
    */
-  static async revokeKey(keyString, reason = 'Administrative revocation') {
+  static async revokeKey(keyString) {
     const normalizedKey = this.normalizeKey(keyString);
-    const keyId = crypto.createHash('sha256').update(normalizedKey).digest('hex');
-    const keyRef = db.collection('secret_keys').doc(keyId);
-
-    const doc = await keyRef.get();
-    if (!doc.exists) {
-      return { success: false, message: 'Key not found.' };
-    }
-
-    const data = doc.data();
-    await keyRef.update({
-      isRevoked: true,
-      status: 'revoked',
-      revokedReason: reason,
-      revokedAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    // Optionally revoke for users who redeemed it
-    const users = data.redeemedBy || [];
-    for (const u of users) {
-      if (u.userId) {
-        await db.collection('users').doc(u.userId).set({
-          is_premium: false,
-          premium_status: 'revoked',
-          premium_revoked_at: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
-
-        await db.collection('therivdata').doc(u.userId).set({ premiumStatus: false }, { merge: true });
-        await db.collection('therivavadata').doc(u.userId).set({ premiumStatus: false }, { merge: true });
-      }
-    }
-
-    logger.warn(`Secret key revoked: ${keyId} (Reason: ${reason})`);
-    return { success: true, message: `Key successfully revoked. ${users.length} user(s) updated.` };
+    const result = db.prepare(`UPDATE secret_keys SET is_active = 0 WHERE key_string = ?`).run(normalizedKey);
+    return { success: result.changes > 0, message: result.changes > 0 ? 'Key revoked.' : 'Key not found.' };
   }
 
   /**
@@ -264,25 +208,24 @@ class SecretKeyService {
    */
   static async getKeyStatus(keyString) {
     const normalizedKey = this.normalizeKey(keyString);
-    const keyId = crypto.createHash('sha256').update(normalizedKey).digest('hex');
-    const doc = await db.collection('secret_keys').doc(keyId).get();
+    const key = db.prepare(`SELECT * FROM secret_keys WHERE key_string = ?`).get(normalizedKey);
 
-    if (!doc.exists) {
+    if (!key) {
       return { exists: false };
     }
 
-    const data = doc.data();
+    const redemptions = db.prepare(`SELECT COUNT(*) as count FROM secret_key_redemptions WHERE key_string = ?`).get(normalizedKey);
+
     return {
       exists: true,
-      keyId,
-      tier: data.tier,
-      status: data.status,
-      isRevoked: data.isRevoked,
-      maxUses: data.maxUses,
-      useCount: data.useCount,
-      createdAt: data.createdAt,
-      expiresAt: data.expiresAt,
-      redeemedCount: (data.redeemedBy || []).length
+      key: key.key_string,
+      tier: key.tier,
+      isActive: Boolean(key.is_active),
+      maxUses: key.max_uses,
+      currentUses: key.current_uses,
+      redeemedCount: redemptions?.count || 0,
+      createdAt: key.created_at,
+      expiresAt: key.expires_at
     };
   }
 }
