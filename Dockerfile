@@ -1,10 +1,7 @@
-# Production Dockerfile for Rivava Backend (Debian-slim for 100% stable SQLite native C++ binaries)
+# Production Dockerfile for Rivava Backend (Powered by Turso Cloud SQLite & Node.js)
 FROM node:20-slim AS builder
 
 WORKDIR /app
-
-# Install build tools for native addons
-RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ && rm -rf /var/lib/apt/lists/*
 
 COPY package*.json ./
 RUN npm ci --only=production
@@ -19,11 +16,9 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=3000
 
-# Create persistent data directory and non-root user
+# Create non-root system user
 RUN groupadd -g 1001 nodejs && \
-    useradd -u 1001 -g nodejs -s /bin/sh nodejs && \
-    mkdir -p /app/data && \
-    chown -R nodejs:nodejs /app
+    useradd -u 1001 -g nodejs -s /bin/sh nodejs
 
 COPY --from=builder --chown=nodejs:nodejs /app ./
 

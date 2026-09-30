@@ -3,13 +3,11 @@ const db = require('../config/database');
 const logger = require('../utils/logger');
 const NotificationService = require('./notification.service');
 
-// Charset without ambiguous characters (no 0, O, 1, I, L)
 const KEY_CHARSET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
 
 class SecretKeyService {
   /**
    * Generate a cryptographically secure, unpredictable, random license key.
-   * Format: RIV-XXXX-XXXX-XXXX-XXXX (e.g. RIV-9K7X-W3P8-2A4M-7Q6L)
    */
   static generateRandomKeyString(prefix = 'RIV') {
     const segments = 4;
@@ -30,7 +28,7 @@ class SecretKeyService {
   }
 
   /**
-   * Normalizes a user-input key (removes extra spaces, converts to uppercase).
+   * Normalizes a user-input key.
    */
   static normalizeKey(keyString) {
     if (!keyString) return '';
@@ -38,7 +36,7 @@ class SecretKeyService {
   }
 
   /**
-   * Generates and stores new secure keys in SQLite.
+   * Generates and stores new secure keys in Turso.
    */
   static async createSecretKey({
     tier = 'portfolio_premium',
@@ -54,13 +52,15 @@ class SecretKeyService {
     const expiresAt = expiresInDays ? (now + expiresInDays * 24 * 60 * 60 * 1000) : null;
     const cleanEmail = assignedEmail ? assignedEmail.toLowerCase().trim() : null;
 
-    const stmt = db.prepare(`
-      INSERT INTO secret_keys (key_string, tier, max_uses, current_uses, assigned_email, expires_at, notes, created_by, is_active, created_at)
-      VALUES (?, ?, ?, 0, ?, ?, ?, ?, 1, ?)
-    `);
-    stmt.run(rawKey, tier, Number(maxUses) || 1, cleanEmail, expiresAt, notes, createdBy, now);
+    await db.execute({
+      sql: `
+        INSERT INTO secret_keys (key_string, tier, max_uses, current_uses, assigned_email, expires_at, notes, created_by, is_active, created_at)
+        VALUES (?, ?, ?, 0, ?, ?, ?, ?, 1, ?)
+      `,
+      args: [rawKey, tier, Number(maxUses) || 1, cleanEmail, expiresAt, notes, createdBy, now]
+    });
 
-    logger.info(`Secure Secret Key created in SQLite: ${rawKey.substring(0, 8)}... (Tier: ${tier}, MaxUses: ${maxUses})`);
+    logger.info(`Secure Secret Key created in Turso: ${rawKey.substring(0, 8)}... (Tier: ${tier}, MaxUses: ${maxUses})`);
 
     return {
       key: rawKey,
@@ -71,7 +71,7 @@ class SecretKeyService {
   }
 
   /**
-   * Atomically verifies and redeems a secret key for a specific user in SQLite.
+   * Atomically verifies and redeems a secret key for a specific user in Turso.
    */
   static async verifyAndRedeemKey({ keyString, userId, userEmail }) {
     if (!keyString || !keyString.trim()) {
@@ -86,106 +86,111 @@ class SecretKeyService {
     const now = Date.now();
 
     try {
-      const redeemTx = db.transaction(() => {
-        const keyRecord = db.prepare(`SELECT * FROM secret_keys WHERE key_string = ?`).get(normalizedKey);
-
-        if (!keyRecord) {
-          return {
-            success: false,
-            code: 'INVALID_KEY',
-            message: 'Invalid secret key. Please check and try again.'
-          };
-        }
-
-        if (!keyRecord.is_active) {
-          return {
-            success: false,
-            code: 'KEY_REVOKED',
-            message: 'This key has been revoked or deactivated.'
-          };
-        }
-
-        if (keyRecord.expires_at && now > keyRecord.expires_at) {
-          return {
-            success: false,
-            code: 'KEY_EXPIRED',
-            message: 'This secret key has expired.'
-          };
-        }
-
-        if (keyRecord.assigned_email && userEmail) {
-          if (keyRecord.assigned_email.toLowerCase() !== userEmail.toLowerCase()) {
-            return {
-              success: false,
-              code: 'EMAIL_MISMATCH',
-              message: 'This key was issued for a different account.'
-            };
-          }
-        }
-
-        if (keyRecord.current_uses >= keyRecord.max_uses) {
-          return {
-            success: false,
-            code: 'ALREADY_REDEEMED',
-            message: 'This secret key has reached its maximum uses.'
-          };
-        }
-
-        const existingClaim = db.prepare(`
-          SELECT * FROM secret_key_redemptions WHERE key_string = ? AND user_id = ?
-        `).get(normalizedKey, userId);
-
-        if (existingClaim) {
-          return {
-            success: false,
-            code: 'ALREADY_CLAIMED_BY_USER',
-            message: 'You have already activated this key on your account.'
-          };
-        }
-
-        // Apply redemption
-        const newUses = keyRecord.current_uses + 1;
-        db.prepare(`UPDATE secret_keys SET current_uses = ? WHERE key_string = ?`).run(newUses, normalizedKey);
-
-        db.prepare(`
-          INSERT INTO secret_key_redemptions (key_string, user_id, user_email, redeemed_at)
-          VALUES (?, ?, ?, ?)
-        `).run(normalizedKey, userId, userEmail || null, now);
-
-        // Update User Entitlement in SQLite
-        db.prepare(`
-          INSERT INTO users (id, is_premium, premium_status, premium_source, premium_plan, premium_unlocked_at, updated_at)
-          VALUES (?, 1, 'active', 'secret_key', ?, ?, ?)
-          ON CONFLICT(id) DO UPDATE SET
-            is_premium = 1,
-            premium_status = 'active',
-            premium_source = 'secret_key',
-            premium_plan = excluded.premium_plan,
-            premium_unlocked_at = excluded.premium_unlocked_at,
-            updated_at = excluded.updated_at
-        `).run(userId, keyRecord.tier || 'portfolio_premium', now, now);
-
-        return {
-          success: true,
-          code: 'SUCCESS',
-          tier: keyRecord.tier || 'portfolio_premium',
-          message: 'Premium access successfully unlocked!'
-        };
+      const keyRes = await db.execute({
+        sql: 'SELECT * FROM secret_keys WHERE key_string = ?',
+        args: [normalizedKey]
       });
+      const keyRecord = keyRes.rows[0];
 
-      const result = redeemTx();
-
-      if (result.success) {
-        NotificationService.sendToUser(userId, {
-          title: '🎉 Secret Key Activated!',
-          body: `Your account has been upgraded to ${result.tier.toUpperCase()} tier.`,
-          data: { type: 'KEY_REDEEMED', tier: result.tier }
-        }).catch(() => {});
+      if (!keyRecord) {
+        return {
+          success: false,
+          code: 'INVALID_KEY',
+          message: 'Invalid secret key. Please check and try again.'
+        };
       }
 
-      return result;
+      if (!keyRecord.is_active) {
+        return {
+          success: false,
+          code: 'KEY_REVOKED',
+          message: 'This key has been revoked or deactivated.'
+        };
+      }
+
+      if (keyRecord.expires_at && now > Number(keyRecord.expires_at)) {
+        return {
+          success: false,
+          code: 'KEY_EXPIRED',
+          message: 'This secret key has expired.'
+        };
+      }
+
+      if (keyRecord.assigned_email && userEmail) {
+        if (keyRecord.assigned_email.toLowerCase() !== userEmail.toLowerCase()) {
+          return {
+            success: false,
+            code: 'EMAIL_MISMATCH',
+            message: 'This key was issued for a different account.'
+          };
+        }
+      }
+
+      const currentUses = Number(keyRecord.current_uses) || 0;
+      const maxUses = Number(keyRecord.max_uses) || 1;
+
+      if (currentUses >= maxUses) {
+        return {
+          success: false,
+          code: 'ALREADY_REDEEMED',
+          message: 'This secret key has reached its maximum uses.'
+        };
+      }
+
+      const existingClaimRes = await db.execute({
+        sql: 'SELECT * FROM secret_key_redemptions WHERE key_string = ? AND user_id = ?',
+        args: [normalizedKey, userId]
+      });
+
+      if (existingClaimRes.rows.length > 0) {
+        return {
+          success: false,
+          code: 'ALREADY_CLAIMED_BY_USER',
+          message: 'You have already activated this key on your account.'
+        };
+      }
+
+      // Apply redemption updates via batch
+      const newUses = currentUses + 1;
+      await db.batch([
+        {
+          sql: 'UPDATE secret_keys SET current_uses = ? WHERE key_string = ?',
+          args: [newUses, normalizedKey]
+        },
+        {
+          sql: 'INSERT INTO secret_key_redemptions (key_string, user_id, user_email, redeemed_at) VALUES (?, ?, ?, ?)',
+          args: [normalizedKey, userId, userEmail || null, now]
+        },
+        {
+          sql: `
+            INSERT INTO users (id, is_premium, premium_status, premium_source, premium_plan, premium_unlocked_at, updated_at)
+            VALUES (?, 1, 'active', 'secret_key', ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              is_premium = 1,
+              premium_status = 'active',
+              premium_source = 'secret_key',
+              premium_plan = excluded.premium_plan,
+              premium_unlocked_at = excluded.premium_unlocked_at,
+              updated_at = excluded.updated_at
+          `,
+          args: [userId, keyRecord.tier || 'portfolio_premium', now, now]
+        }
+      ]);
+
+      NotificationService.sendToUser(userId, {
+        title: '🎉 Secret Key Activated!',
+        body: `Your account has been upgraded to ${String(keyRecord.tier).toUpperCase()} tier.`,
+        data: { type: 'KEY_REDEEMED', tier: keyRecord.tier }
+      }).catch(() => {});
+
+      return {
+        success: true,
+        code: 'SUCCESS',
+        tier: keyRecord.tier || 'portfolio_premium',
+        message: 'Premium access successfully unlocked!'
+      };
     } catch (error) {
-      logger.error('Error during key redemption in SQLite:', error);
+      logger.error('Error during key redemption in Turso:', error);
       return {
         success: false,
         code: 'TRANSACTION_ERROR',
@@ -195,12 +200,15 @@ class SecretKeyService {
   }
 
   /**
-   * Revoke a key or revoke a user's entitlement.
+   * Revoke a key.
    */
   static async revokeKey(keyString) {
     const normalizedKey = this.normalizeKey(keyString);
-    const result = db.prepare(`UPDATE secret_keys SET is_active = 0 WHERE key_string = ?`).run(normalizedKey);
-    return { success: result.changes > 0, message: result.changes > 0 ? 'Key revoked.' : 'Key not found.' };
+    const result = await db.execute({
+      sql: 'UPDATE secret_keys SET is_active = 0 WHERE key_string = ?',
+      args: [normalizedKey]
+    });
+    return { success: result.rowsAffected > 0, message: result.rowsAffected > 0 ? 'Key revoked.' : 'Key not found.' };
   }
 
   /**
@@ -208,13 +216,20 @@ class SecretKeyService {
    */
   static async getKeyStatus(keyString) {
     const normalizedKey = this.normalizeKey(keyString);
-    const key = db.prepare(`SELECT * FROM secret_keys WHERE key_string = ?`).get(normalizedKey);
+    const keyRes = await db.execute({
+      sql: 'SELECT * FROM secret_keys WHERE key_string = ?',
+      args: [normalizedKey]
+    });
+    const key = keyRes.rows[0];
 
     if (!key) {
       return { exists: false };
     }
 
-    const redemptions = db.prepare(`SELECT COUNT(*) as count FROM secret_key_redemptions WHERE key_string = ?`).get(normalizedKey);
+    const redemptionsRes = await db.execute({
+      sql: 'SELECT COUNT(*) as count FROM secret_key_redemptions WHERE key_string = ?',
+      args: [normalizedKey]
+    });
 
     return {
       exists: true,
@@ -223,7 +238,7 @@ class SecretKeyService {
       isActive: Boolean(key.is_active),
       maxUses: key.max_uses,
       currentUses: key.current_uses,
-      redeemedCount: redemptions?.count || 0,
+      redeemedCount: redemptionsRes.rows[0]?.count || 0,
       createdAt: key.created_at,
       expiresAt: key.expires_at
     };

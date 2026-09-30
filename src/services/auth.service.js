@@ -11,19 +11,21 @@ const logger = require('../utils/logger');
 class AuthService {
   /**
    * Generates and dispatches an OTP.
-   * @param {string} phone E.164 phone string (e.g. +919876543210)
+   * @param {string} phone E.164 phone string
    * @param {string} rawPhone10 10-digit phone string
-   * @returns {Promise<{ success: boolean, message: string }>}
    */
   static async requestOtp(phone, rawPhone10) {
     const now = Date.now();
 
-    const existing = db.prepare(`SELECT * FROM otps WHERE phone = ?`).get(phone);
+    const result = await db.execute({
+      sql: 'SELECT * FROM otps WHERE phone = ?',
+      args: [phone]
+    });
+    const existing = result.rows[0];
     let resendCount = 0;
 
     if (existing) {
-      const createdAt = existing.created_at || 0;
-      // Check if within expiry window
+      const createdAt = Number(existing.created_at) || 0;
       if (now - createdAt < AuthConstants.OTP_EXPIRY_MINUTES * 60 * 1000) {
         const elapsedSeconds = Math.floor((now - createdAt) / 1000);
         if (elapsedSeconds < AuthConstants.RESEND_COOLDOWN_SECONDS) {
@@ -31,26 +33,28 @@ class AuthService {
           throw ApiError.tooManyRequests(`Please wait ${remaining} seconds before requesting a new OTP.`);
         }
       }
-      resendCount = (existing.resend_count || 0) + 1;
+      resendCount = (Number(existing.resend_count) || 0) + 1;
     }
 
     const otp = OtpService.generateOTP();
     await OtpService.sendSmsOTP(rawPhone10, otp);
 
     const expiresAt = now + AuthConstants.OTP_EXPIRY_MINUTES * 60 * 1000;
-    const stmt = db.prepare(`
-      INSERT INTO otps (phone, otp, attempts, resend_count, created_at, expires_at)
-      VALUES (?, ?, 0, ?, ?, ?)
-      ON CONFLICT(phone) DO UPDATE SET
-        otp = excluded.otp,
-        attempts = 0,
-        resend_count = excluded.resend_count,
-        created_at = excluded.created_at,
-        expires_at = excluded.expires_at
-    `);
-    stmt.run(phone, otp, resendCount, now, expiresAt);
+    await db.execute({
+      sql: `
+        INSERT INTO otps (phone, otp, attempts, resend_count, created_at, expires_at)
+        VALUES (?, ?, 0, ?, ?, ?)
+        ON CONFLICT(phone) DO UPDATE SET
+          otp = excluded.otp,
+          attempts = 0,
+          resend_count = excluded.resend_count,
+          created_at = excluded.created_at,
+          expires_at = excluded.expires_at
+      `,
+      args: [phone, otp, resendCount, now, expiresAt]
+    });
 
-    logger.info(`OTP generated & stored in SQLite for ${phone}`);
+    logger.info(`OTP generated & stored in Turso Cloud SQLite for ${phone}`);
     return {
       success: true,
       message: 'OTP sent successfully.'
@@ -61,10 +65,13 @@ class AuthService {
    * Verifies an OTP and produces authentication token.
    * @param {string} phone E.164 phone string
    * @param {string} inputOtp 6-digit OTP code entered by user
-   * @returns {Promise<{ token: string, uid: string }>}
    */
   static async verifyOtp(phone, inputOtp) {
-    const record = db.prepare(`SELECT * FROM otps WHERE phone = ?`).get(phone);
+    const result = await db.execute({
+      sql: 'SELECT * FROM otps WHERE phone = ?',
+      args: [phone]
+    });
+    const record = result.rows[0];
 
     if (!record) {
       throw ApiError.badRequest('OTP not found or has already expired. Please request a new OTP.');
@@ -73,25 +80,29 @@ class AuthService {
     const now = Date.now();
 
     // Check expiry
-    if (now > record.expires_at) {
-      db.prepare(`DELETE FROM otps WHERE phone = ?`).run(phone);
+    if (now > Number(record.expires_at)) {
+      await db.execute({ sql: 'DELETE FROM otps WHERE phone = ?', args: [phone] });
       throw ApiError.badRequest('OTP has expired. Please request a new one.');
     }
 
     // Check attempts limit
-    if (record.attempts >= AuthConstants.MAX_OTP_ATTEMPTS) {
-      db.prepare(`DELETE FROM otps WHERE phone = ?`).run(phone);
+    const attempts = Number(record.attempts) || 0;
+    if (attempts >= AuthConstants.MAX_OTP_ATTEMPTS) {
+      await db.execute({ sql: 'DELETE FROM otps WHERE phone = ?', args: [phone] });
       throw ApiError.badRequest('Maximum verification attempts exceeded. Please request a new OTP.');
     }
 
     // Compare OTP
     if (record.otp !== inputOtp) {
-      const newAttempts = record.attempts + 1;
-      db.prepare(`UPDATE otps SET attempts = ? WHERE phone = ?`).run(newAttempts, phone);
+      const newAttempts = attempts + 1;
+      await db.execute({
+        sql: 'UPDATE otps SET attempts = ? WHERE phone = ?',
+        args: [newAttempts, phone]
+      });
       const remainingAttempts = AuthConstants.MAX_OTP_ATTEMPTS - newAttempts;
 
       if (remainingAttempts <= 0) {
-        db.prepare(`DELETE FROM otps WHERE phone = ?`).run(phone);
+        await db.execute({ sql: 'DELETE FROM otps WHERE phone = ?', args: [phone] });
         throw ApiError.badRequest('Invalid OTP. Maximum attempts exceeded. Please request a new OTP.');
       }
 
@@ -99,19 +110,20 @@ class AuthService {
     }
 
     // OTP matched - delete OTP record
-    db.prepare(`DELETE FROM otps WHERE phone = ?`).run(phone);
+    await db.execute({ sql: 'DELETE FROM otps WHERE phone = ?', args: [phone] });
 
-    // Ensure user exists in SQLite
-    const userStmt = db.prepare(`
-      INSERT INTO users (id, phone, updated_at)
-      VALUES (?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        phone = excluded.phone,
-        updated_at = excluded.updated_at
-    `);
-    userStmt.run(phone, phone, now);
+    // Upsert user in Turso
+    await db.execute({
+      sql: `
+        INSERT INTO users (id, phone, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          phone = excluded.phone,
+          updated_at = excluded.updated_at
+      `,
+      args: [phone, phone, now]
+    });
 
-    // Generate Custom Token (or secure fallback if Firebase Admin is in offline mode)
     const uid = phone;
     let customToken = `token_${uid}_${Date.now()}`;
     try {
@@ -122,10 +134,10 @@ class AuthService {
         });
       }
     } catch (tokenErr) {
-      logger.warn(`Firebase token generation fallback: ${tokenErr.message}`);
+      logger.warn(`Firebase token fallback: ${tokenErr.message}`);
     }
 
-    logger.info(`Authentication successful for ${phone}`);
+    logger.info(`Authentication successful in Turso for ${phone}`);
     return {
       token: customToken,
       uid
@@ -146,18 +158,18 @@ class AuthService {
     const now = Date.now();
     const expiresAt = now + 15 * 60 * 1000; // 15 minutes
 
-    // Store in SQLite database
-    const stmt = db.prepare(`
-      INSERT INTO password_resets (email, token, created_at, expires_at)
-      VALUES (?, ?, ?, ?)
-      ON CONFLICT(email) DO UPDATE SET
-        token = excluded.token,
-        created_at = excluded.created_at,
-        expires_at = excluded.expires_at
-    `);
-    stmt.run(cleanEmail, token, now, expiresAt);
+    await db.execute({
+      sql: `
+        INSERT INTO password_resets (email, token, created_at, expires_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(email) DO UPDATE SET
+          token = excluded.token,
+          created_at = excluded.created_at,
+          expires_at = excluded.expires_at
+      `,
+      args: [cleanEmail, token, now, expiresAt]
+    });
 
-    // Construct web redirect link
     const baseUrl = config.baseUrl || 'https://backend-6fey.onrender.com';
     const resetLink = `${baseUrl}/reset?token=${token}&email=${encodeURIComponent(cleanEmail)}`;
 
@@ -192,21 +204,24 @@ class AuthService {
     const cleanEmail = email.trim().toLowerCase();
     const now = Date.now();
 
-    const record = db.prepare(`SELECT * FROM password_resets WHERE email = ?`).get(cleanEmail);
+    const result = await db.execute({
+      sql: 'SELECT * FROM password_resets WHERE email = ?',
+      args: [cleanEmail]
+    });
+    const record = result.rows[0];
 
     if (!record || record.token !== token) {
       throw ApiError.badRequest('Invalid or expired password reset token.');
     }
 
-    if (now > record.expires_at) {
-      db.prepare(`DELETE FROM password_resets WHERE email = ?`).run(cleanEmail);
+    if (now > Number(record.expires_at)) {
+      await db.execute({ sql: 'DELETE FROM password_resets WHERE email = ?', args: [cleanEmail] });
       throw ApiError.badRequest('Password reset token has expired. Please request a new one.');
     }
 
     // Cleanup token
-    db.prepare(`DELETE FROM password_resets WHERE email = ?`).run(cleanEmail);
+    await db.execute({ sql: 'DELETE FROM password_resets WHERE email = ?', args: [cleanEmail] });
 
-    // Update Firebase Auth password if configured
     try {
       if (admin && admin.auth) {
         const userRecord = await admin.auth().getUserByEmail(cleanEmail);
@@ -219,7 +234,7 @@ class AuthService {
       logger.warn(`Firebase Auth update skipped: ${fbErr.message}`);
     }
 
-    logger.info(`Password successfully reset for ${cleanEmail}`);
+    logger.info(`Password successfully reset in Turso for ${cleanEmail}`);
     return {
       success: true,
       message: 'Password reset successfully. You can now login.'

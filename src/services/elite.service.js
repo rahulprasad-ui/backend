@@ -5,10 +5,7 @@ const NotificationService = require('./notification.service');
 
 class EliteService {
   /**
-   * Creates an Elite payment order in SQLite.
-   * @param {string} uid User ID
-   * @param {number} amount Amount in paise
-   * @param {string} [plan='elite_3300']
+   * Creates an Elite payment order in Turso.
    */
   static async createOrder(uid, amount, plan = 'elite_3300') {
     if (!uid) {
@@ -19,13 +16,15 @@ class EliteService {
     const amountInRupees = amount ? amount / 100 : 3300;
     const now = Date.now();
 
-    const stmt = db.prepare(`
-      INSERT INTO payments (order_id, user_id, plan, amount, amount_paise, currency, status, gateway_provider, created_at)
-      VALUES (?, ?, ?, ?, ?, 'INR', 'created', 'razorpay', ?)
-    `);
-    stmt.run(orderId, uid, plan, amountInRupees, amount || 330000, now);
+    await db.execute({
+      sql: `
+        INSERT INTO payments (order_id, user_id, plan, amount, amount_paise, currency, status, gateway_provider, created_at)
+        VALUES (?, ?, ?, ?, ?, 'INR', 'created', 'razorpay', ?)
+      `,
+      args: [orderId, uid, plan, amountInRupees, amount || 330000, now]
+    });
 
-    logger.info(`Elite order created in SQLite: ${orderId} for UID: ${uid}`);
+    logger.info(`Elite order created in Turso: ${orderId} for UID: ${uid}`);
 
     return {
       orderId,
@@ -36,7 +35,7 @@ class EliteService {
   }
 
   /**
-   * Verifies payment and activates user Elite subscription inside an atomic SQLite transaction.
+   * Verifies payment and activates user Elite subscription in Turso.
    */
   static async verifyPayment(uid, orderId) {
     if (!uid || !orderId) {
@@ -46,54 +45,48 @@ class EliteService {
     const now = Date.now();
     const nextBilling = now + 30 * 24 * 60 * 60 * 1000;
 
-    const verifyTx = db.transaction(() => {
-      const order = db.prepare(`SELECT * FROM payments WHERE order_id = ? AND user_id = ?`).get(orderId, uid);
-
-      if (!order) {
-        throw ApiError.notFound('Payment order record not found.');
-      }
-
-      if (order.status === 'success') {
-        return { success: true, isElite: true, message: 'Payment has already been processed.' };
-      }
-
-      const paymentId = `txn_${Date.now()}`;
-
-      // Update payment record
-      db.prepare(`
-        UPDATE payments SET status = 'success', payment_id = ?, verified_at = ? WHERE order_id = ?
-      `).run(paymentId, now, orderId);
-
-      // Update elite subscription
-      db.prepare(`
-        INSERT INTO elite_subscriptions (user_id, is_elite, plan, minutes_remaining, monthly_minutes, auto_renew, next_billing_date, payment_status, updated_at)
-        VALUES (?, 1, ?, 600, 600, 1, ?, 'active', ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-          is_elite = 1,
-          plan = excluded.plan,
-          minutes_remaining = 600,
-          monthly_minutes = 600,
-          auto_renew = 1,
-          next_billing_date = excluded.next_billing_date,
-          payment_status = 'active',
-          updated_at = excluded.updated_at
-      `).run(uid, order.plan || 'elite_3300', nextBilling, now);
-
-      // Update user premium status
-      db.prepare(`
-        UPDATE users SET is_premium = 1, premium_status = 'active', premium_plan = 'elite', updated_at = ? WHERE id = ?
-      `).run(now, uid);
-
-      return {
-        success: true,
-        isElite: true,
-        plan: order.plan || 'elite_3300',
-        expiresAt: new Date(nextBilling).toISOString(),
-        minutesRemaining: 600
-      };
+    const orderRes = await db.execute({
+      sql: 'SELECT * FROM payments WHERE order_id = ? AND user_id = ?',
+      args: [orderId, uid]
     });
+    const order = orderRes.rows[0];
 
-    const result = verifyTx();
+    if (!order) {
+      throw ApiError.notFound('Payment order record not found.');
+    }
+
+    if (order.status === 'success') {
+      return { success: true, isElite: true, message: 'Payment has already been processed.' };
+    }
+
+    const paymentId = `txn_${Date.now()}`;
+
+    await db.batch([
+      {
+        sql: `UPDATE payments SET status = 'success', payment_id = ?, verified_at = ? WHERE order_id = ?`,
+        args: [paymentId, now, orderId]
+      },
+      {
+        sql: `
+          INSERT INTO elite_subscriptions (user_id, is_elite, plan, minutes_remaining, monthly_minutes, auto_renew, next_billing_date, payment_status, updated_at)
+          VALUES (?, 1, ?, 600, 600, 1, ?, 'active', ?)
+          ON CONFLICT(user_id) DO UPDATE SET
+            is_elite = 1,
+            plan = excluded.plan,
+            minutes_remaining = 600,
+            monthly_minutes = 600,
+            auto_renew = 1,
+            next_billing_date = excluded.next_billing_date,
+            payment_status = 'active',
+            updated_at = excluded.updated_at
+        `,
+        args: [uid, order.plan || 'elite_3300', nextBilling, now]
+      },
+      {
+        sql: `UPDATE users SET is_premium = 1, premium_status = 'active', premium_plan = 'elite', updated_at = ? WHERE id = ?`,
+        args: [now, uid]
+      }
+    ]);
 
     NotificationService.sendToUser(uid, {
       title: '👑 Welcome to Elite Club!',
@@ -101,8 +94,14 @@ class EliteService {
       data: { type: 'ELITE_ACTIVATED', orderId }
     }).catch(() => {});
 
-    logger.info(`Elite payment verified in SQLite for user ${uid}, order: ${orderId}`);
-    return result;
+    logger.info(`Elite payment verified in Turso for user ${uid}, order: ${orderId}`);
+    return {
+      success: true,
+      isElite: true,
+      plan: order.plan || 'elite_3300',
+      expiresAt: new Date(nextBilling).toISOString(),
+      minutesRemaining: 600
+    };
   }
 
   /**
@@ -124,34 +123,36 @@ class EliteService {
     const sessionId = `session_${uid}_${Date.now()}`;
     const now = Date.now();
 
-    const bookTx = db.transaction(() => {
-      const sub = db.prepare(`SELECT * FROM elite_subscriptions WHERE user_id = ?`).get(uid);
-
-      if (!sub || !sub.is_elite || sub.payment_status !== 'active') {
-        throw ApiError.badRequest('Your Elite subscription is not active.');
-      }
-
-      if (sub.minutes_remaining < numDuration) {
-        throw ApiError.badRequest(`Insufficient minutes. You have ${sub.minutes_remaining} minutes available.`);
-      }
-
-      const newMinutes = sub.minutes_remaining - numDuration;
-      db.prepare(`UPDATE elite_subscriptions SET minutes_remaining = ?, updated_at = ? WHERE user_id = ?`).run(newMinutes, now, uid);
-
-      db.prepare(`
-        INSERT INTO elite_sessions (id, user_id, duration, date_millis, time_slot, status, created_at)
-        VALUES (?, ?, ?, ?, ?, 'booked', ?)
-      `).run(sessionId, uid, numDuration, dateMillis, time, now);
-
-      return {
-        success: true,
-        sessionId,
-        minutesBooked: numDuration,
-        minutesRemaining: newMinutes
-      };
+    const subRes = await db.execute({
+      sql: 'SELECT * FROM elite_subscriptions WHERE user_id = ?',
+      args: [uid]
     });
+    const sub = subRes.rows[0];
 
-    const result = bookTx();
+    if (!sub || !sub.is_elite || sub.payment_status !== 'active') {
+      throw ApiError.badRequest('Your Elite subscription is not active.');
+    }
+
+    const currentMinutes = Number(sub.minutes_remaining) || 0;
+    if (currentMinutes < numDuration) {
+      throw ApiError.badRequest(`Insufficient minutes. You have ${currentMinutes} minutes available.`);
+    }
+
+    const newMinutes = currentMinutes - numDuration;
+
+    await db.batch([
+      {
+        sql: 'UPDATE elite_subscriptions SET minutes_remaining = ?, updated_at = ? WHERE user_id = ?',
+        args: [newMinutes, now, uid]
+      },
+      {
+        sql: `
+          INSERT INTO elite_sessions (id, user_id, duration, date_millis, time_slot, status, created_at)
+          VALUES (?, ?, ?, ?, ?, 'booked', ?)
+        `,
+        args: [sessionId, uid, numDuration, dateMillis, time, now]
+      }
+    ]);
 
     NotificationService.sendToUser(uid, {
       title: '📅 Session Booked',
@@ -159,8 +160,13 @@ class EliteService {
       data: { type: 'SESSION_BOOKED', sessionId }
     }).catch(() => {});
 
-    logger.info(`Session booked in SQLite for UID: ${uid}, session ID: ${result.sessionId}`);
-    return result;
+    logger.info(`Session booked in Turso for UID: ${uid}, session ID: ${sessionId}`);
+    return {
+      success: true,
+      sessionId,
+      minutesBooked: numDuration,
+      minutesRemaining: newMinutes
+    };
   }
 
   /**
@@ -172,15 +178,16 @@ class EliteService {
     }
 
     const now = Date.now();
-    const result = db.prepare(`
-      UPDATE elite_subscriptions SET auto_renew = 0, updated_at = ? WHERE user_id = ?
-    `).run(now, uid);
+    const result = await db.execute({
+      sql: 'UPDATE elite_subscriptions SET auto_renew = 0, updated_at = ? WHERE user_id = ?',
+      args: [now, uid]
+    });
 
-    if (result.changes === 0) {
+    if (result.rowsAffected === 0) {
       throw ApiError.notFound('No subscription found to cancel.');
     }
 
-    logger.info(`Subscription auto-renew cancelled in SQLite for user: ${uid}`);
+    logger.info(`Subscription auto-renew cancelled in Turso for user: ${uid}`);
     return { success: true, message: 'Subscription auto-renew cancelled successfully.' };
   }
 
@@ -192,7 +199,11 @@ class EliteService {
       throw ApiError.badRequest('User ID is required.');
     }
 
-    const sub = db.prepare(`SELECT * FROM elite_subscriptions WHERE user_id = ?`).get(uid);
+    const subRes = await db.execute({
+      sql: 'SELECT * FROM elite_subscriptions WHERE user_id = ?',
+      args: [uid]
+    });
+    const sub = subRes.rows[0];
 
     if (!sub) {
       return {

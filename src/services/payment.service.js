@@ -38,7 +38,7 @@ class PaymentService {
   }
 
   /**
-   * Initiates and registers a new payment order securely in SQLite.
+   * Initiates and registers a new payment order securely in Turso.
    */
   static async createOrder({ userId, userEmail = null, plan = 'portfolio_premium', amountPaise = 1100 }) {
     if (!userId) {
@@ -50,13 +50,15 @@ class PaymentService {
     const orderId = `order_${userId.substring(0, 8)}_${Date.now()}`;
     const now = Date.now();
 
-    const stmt = db.prepare(`
-      INSERT INTO payments (order_id, user_id, user_email, plan, amount, amount_paise, currency, status, gateway_provider, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'created', 'razorpay', ?)
-    `);
-    stmt.run(orderId, userId, userEmail, plan, amountInRupees, numAmountPaise, config.paymentGateway.currency, now);
+    await db.execute({
+      sql: `
+        INSERT INTO payments (order_id, user_id, user_email, plan, amount, amount_paise, currency, status, gateway_provider, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'created', 'razorpay', ?)
+      `,
+      args: [orderId, userId, userEmail, plan, amountInRupees, numAmountPaise, config.paymentGateway.currency, now]
+    });
 
-    logger.info(`Payment order created: ${orderId} in SQLite (Amount: Rs. ${amountInRupees}, Plan: ${plan})`);
+    logger.info(`Payment order created: ${orderId} in Turso Cloud SQLite (Amount: Rs. ${amountInRupees}, Plan: ${plan})`);
 
     const paymentUrl = `${config.baseUrl}/pay/${orderId}`;
 
@@ -76,8 +78,7 @@ class PaymentService {
   }
 
   /**
-   * Server-Side Payment Verification:
-   * Validates signature and updates user's premium entitlement in SQLite atomically.
+   * Server-Side Payment Verification in Turso Cloud SQLite.
    */
   static async verifyPayment({ userId, orderId, paymentId, signature }) {
     if (!userId || !orderId) {
@@ -96,72 +97,71 @@ class PaymentService {
     const assignedSignature = signature || this.generateSignature(orderId, assignedPaymentId);
     const now = Date.now();
 
-    const verifyTransaction = db.transaction(() => {
-      const order = db.prepare(`SELECT * FROM payments WHERE order_id = ?`).get(orderId);
+    const orderRes = await db.execute({
+      sql: 'SELECT * FROM payments WHERE order_id = ?',
+      args: [orderId]
+    });
+    const order = orderRes.rows[0];
 
-      if (!order) {
-        throw ApiError.notFound('Payment order record not found.');
-      }
+    if (!order) {
+      throw ApiError.notFound('Payment order record not found.');
+    }
 
-      if (order.user_id !== userId) {
-        throw ApiError.forbidden('Payment order does not belong to this user.');
-      }
+    if (order.user_id !== userId) {
+      throw ApiError.forbidden('Payment order does not belong to this user.');
+    }
 
-      if (order.status === 'success') {
-        return {
-          success: true,
-          isPremium: true,
-          orderId,
-          paymentId: order.payment_id,
-          message: 'Payment has already been verified and processed.'
-        };
-      }
-
-      // Update payment record
-      db.prepare(`
-        UPDATE payments
-        SET status = 'success', payment_id = ?, signature = ?, verified_at = ?
-        WHERE order_id = ?
-      `).run(assignedPaymentId, assignedSignature, now, orderId);
-
-      // Update user premium status in SQLite
-      db.prepare(`
-        INSERT INTO users (id, is_premium, premium_status, premium_source, premium_plan, premium_unlocked_at, updated_at)
-        VALUES (?, 1, 'active', 'payment_gateway', ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-          is_premium = 1,
-          premium_status = 'active',
-          premium_source = 'payment_gateway',
-          premium_plan = excluded.premium_plan,
-          premium_unlocked_at = excluded.premium_unlocked_at,
-          updated_at = excluded.updated_at
-      `).run(userId, order.plan || 'portfolio_premium', now, now);
-
+    if (order.status === 'success') {
       return {
         success: true,
         isPremium: true,
         orderId,
-        paymentId: assignedPaymentId,
-        plan: order.plan || 'portfolio_premium',
-        message: 'Payment verified successfully. Premium access unlocked!'
+        paymentId: order.payment_id,
+        message: 'Payment has already been verified and processed.'
       };
-    });
+    }
 
-    const result = verifyTransaction();
+    // Update payment record & user in Turso batch
+    await db.batch([
+      {
+        sql: `UPDATE payments SET status = 'success', payment_id = ?, signature = ?, verified_at = ? WHERE order_id = ?`,
+        args: [assignedPaymentId, assignedSignature, now, orderId]
+      },
+      {
+        sql: `
+          INSERT INTO users (id, is_premium, premium_status, premium_source, premium_plan, premium_unlocked_at, updated_at)
+          VALUES (?, 1, 'active', 'payment_gateway', ?, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET
+            is_premium = 1,
+            premium_status = 'active',
+            premium_source = 'payment_gateway',
+            premium_plan = excluded.premium_plan,
+            premium_unlocked_at = excluded.premium_unlocked_at,
+            updated_at = excluded.updated_at
+        `,
+        args: [userId, order.plan || 'portfolio_premium', now, now]
+      }
+    ]);
 
-    // Send FCM Push Notification via Firebase
     NotificationService.sendToUser(userId, {
       title: '🎉 Premium Unlocked!',
       body: 'Your payment was successful. Enjoy full access to Rivava TrackFi features.',
       data: { type: 'PREMIUM_UNLOCKED', orderId }
-    }).catch(err => logger.warn(`FCM notification error: ${err.message}`));
+    }).catch(() => {});
 
-    logger.info(`Payment verified and premium unlocked in SQLite for user: ${userId}, order: ${orderId}`);
-    return result;
+    logger.info(`Payment verified and premium unlocked in Turso for user: ${userId}, order: ${orderId}`);
+    return {
+      success: true,
+      isPremium: true,
+      orderId,
+      paymentId: assignedPaymentId,
+      plan: order.plan || 'portfolio_premium',
+      message: 'Payment verified successfully. Premium access unlocked!'
+    };
   }
 
   /**
-   * Webhook event processor for asynchronous Razorpay webhook notifications.
+   * Webhook event processor for Razorpay.
    */
   static async processWebhook({ rawBody, signatureHeader, eventPayload }) {
     if (signatureHeader && config.paymentGateway.webhookSecret) {
@@ -192,23 +192,32 @@ class PaymentService {
 
       if (orderId && userId) {
         const now = Date.now();
-        const order = db.prepare(`SELECT * FROM payments WHERE order_id = ?`).get(orderId);
+        const orderRes = await db.execute({
+          sql: 'SELECT * FROM payments WHERE order_id = ?',
+          args: [orderId]
+        });
+        const order = orderRes.rows[0];
 
         if (order && order.status !== 'success') {
-          db.prepare(`
-            UPDATE payments SET status = 'success', payment_id = ?, verified_at = ? WHERE order_id = ?
-          `).run(paymentId || `webhook_${now}`, now, orderId);
-
-          db.prepare(`
-            INSERT INTO users (id, is_premium, premium_status, premium_source, premium_unlocked_at, updated_at)
-            VALUES (?, 1, 'active', 'payment_webhook', ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-              is_premium = 1,
-              premium_status = 'active',
-              premium_source = 'payment_webhook',
-              premium_unlocked_at = excluded.premium_unlocked_at,
-              updated_at = excluded.updated_at
-          `).run(userId, now, now);
+          await db.batch([
+            {
+              sql: `UPDATE payments SET status = 'success', payment_id = ?, verified_at = ? WHERE order_id = ?`,
+              args: [paymentId || `webhook_${now}`, now, orderId]
+            },
+            {
+              sql: `
+                INSERT INTO users (id, is_premium, premium_status, premium_source, premium_unlocked_at, updated_at)
+                VALUES (?, 1, 'active', 'payment_webhook', ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  is_premium = 1,
+                  premium_status = 'active',
+                  premium_source = 'payment_webhook',
+                  premium_unlocked_at = excluded.premium_unlocked_at,
+                  updated_at = excluded.updated_at
+              `,
+              args: [userId, now, now]
+            }
+          ]);
 
           NotificationService.sendToUser(userId, {
             title: '🎉 Premium Activated!',
@@ -216,7 +225,7 @@ class PaymentService {
             data: { type: 'PREMIUM_ACTIVATED', orderId }
           }).catch(() => {});
 
-          logger.info(`Webhook successfully processed in SQLite for user: ${userId}`);
+          logger.info(`Webhook successfully processed in Turso for user: ${userId}`);
         }
       }
     }
@@ -229,9 +238,11 @@ class PaymentService {
    */
   static async getPaymentsByUser(userId) {
     if (!userId) throw ApiError.badRequest('User ID is required.');
-    return db.prepare(`
-      SELECT * FROM payments WHERE user_id = ? ORDER BY created_at DESC LIMIT 20
-    `).all(userId);
+    const result = await db.execute({
+      sql: 'SELECT * FROM payments WHERE user_id = ? ORDER BY created_at DESC LIMIT 20',
+      args: [userId]
+    });
+    return result.rows;
   }
 }
 
