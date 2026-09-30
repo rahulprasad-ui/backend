@@ -78,6 +78,11 @@ const paymentRoutes = require('./routes/payment.routes');
 app.use('/api/payments', paymentRoutes);
 app.use('/payments', paymentRoutes);
 
+// User Profile & Sync Routes
+const userRoutes = require('./routes/user.routes');
+app.use('/api/users', userRoutes);
+app.use('/users', userRoutes);
+
 // Versioned API Routes (/api/v1)
 app.use('/api/v1', routes);
 
