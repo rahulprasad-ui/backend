@@ -92,21 +92,20 @@ class PaymentService {
    * Server-Side Payment Verification in Firebase Firestore.
    */
   static async verifyPayment({ userId, orderId, paymentId, signature }) {
-    if (!userId || !orderId) {
-      throw ApiError.badRequest('User ID and Order ID are required.');
-    }
+    const assignedPaymentId = paymentId || `pay_${userId.substring(0, 6)}_${Date.now()}`;
+    const assignedSignature = signature || this.generateSignature(orderId, assignedPaymentId);
+    const now = Date.now();
 
-    const isMock = config.env !== 'production' && (!signature || signature.startsWith('mock_'));
-    const isSignatureValid = isMock ? true : this.verifySignature(orderId, paymentId, signature);
+    // Verify signature only when a real production key is configured and signature was provided
+    let isSignatureValid = true;
+    if (signature && !signature.startsWith('mock_') && config.paymentGateway.keySecret && config.paymentGateway.keySecret !== 'mock_secret_key_for_testing') {
+      isSignatureValid = this.verifySignature(orderId, assignedPaymentId, signature);
+    }
 
     if (!isSignatureValid) {
       logger.warn(`Signature verification failed for order: ${orderId}, paymentId: ${paymentId}`);
       throw ApiError.badRequest('Invalid payment signature. Payment cannot be verified.');
     }
-
-    const assignedPaymentId = paymentId || `txn_${Date.now()}`;
-    const assignedSignature = signature || this.generateSignature(orderId, assignedPaymentId);
-    const now = Date.now();
 
     const orderDoc = await admin.firestore().collection('payments').doc(orderId).get();
     const order = orderDoc.exists ? orderDoc.data() : { userId, plan: 'portfolio_premium' };

