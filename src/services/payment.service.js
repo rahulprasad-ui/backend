@@ -47,8 +47,37 @@ class PaymentService {
 
     const numAmountPaise = Math.max(100, Number(amountPaise) || 1100);
     const amountInRupees = numAmountPaise / 100;
-    const orderId = `order_${userId.substring(0, 8)}_${Date.now()}`;
+    let orderId = `order_${userId.substring(0, 8)}_${Date.now()}`;
     const now = Date.now();
+
+    const keyId = config.paymentGateway.keyId;
+    const keySecret = config.paymentGateway.keySecret;
+
+    // Create real Razorpay order if live/test credentials are configured
+    if (keyId && keySecret && !keyId.includes('mock') && !keySecret.includes('mock')) {
+      try {
+        const axios = require('axios');
+        const authHeader = 'Basic ' + Buffer.from(`${keyId}:${keySecret}`).toString('base64');
+        const rzpRes = await axios.post('https://api.razorpay.com/v1/orders', {
+          amount: numAmountPaise,
+          currency: config.paymentGateway.currency,
+          receipt: `rcpt_${userId.substring(0, 6)}_${Date.now()}`,
+          notes: { userId, plan }
+        }, {
+          headers: {
+            'Authorization': authHeader,
+            'Content-Type': 'application/json'
+          }
+        });
+
+        if (rzpRes.data && rzpRes.data.id) {
+          orderId = rzpRes.data.id;
+          logger.info(`Razorpay API Order created: ${orderId}`);
+        }
+      } catch (rzpErr) {
+        logger.warn(`Razorpay API order creation fallback: ${rzpErr.response ? JSON.stringify(rzpErr.response.data) : rzpErr.message}`);
+      }
+    }
 
     const orderData = {
       orderId,
