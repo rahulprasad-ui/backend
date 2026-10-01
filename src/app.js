@@ -39,6 +39,25 @@ app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 // Global Rate Limiting
 app.use(apiLimiter);
 
+// Android App Links Verification (.well-known/assetlinks.json)
+app.get('/.well-known/assetlinks.json', (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  res.status(200).json([
+    {
+      relation: ['delegate_permission/common.handle_all_urls'],
+      target: {
+        namespace: 'android_app',
+        package_name: 'com.rivavafi.universal',
+        sha256_cert_fingerprints: [
+          '46:0E:2B:3A:CB:58:69:46:94:5B:85:F5:F9:3E:2F:8F:65:7E:FB:3E',
+          '10:C5:EC:FE:27:83:37:8B:DE:55:E0:6A:29:E2:48:7B:EC:AA:F3:AD',
+          'B3:0B:15:18:79:88:93:D9:80:C5:65:F8:EE:08:A2:BE:A5:43:90:AC'
+        ]
+      }
+    }
+  ]);
+});
+
 // Direct Link for Email Verification (e.g. /verify?token=...)
 app.get('/verify', VerificationController.verifyToken);
 
