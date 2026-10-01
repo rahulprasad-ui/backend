@@ -143,7 +143,10 @@ class AuthService {
       expiresAt
     });
 
-    const baseUrl = config.baseUrl || 'https://backend-453t.onrender.com';
+    let baseUrl = config.baseUrl || 'https://backend-453t.onrender.com';
+    if (!baseUrl || baseUrl.includes('192.168.') || baseUrl.includes('localhost') || baseUrl.includes('127.0.0.1')) {
+      baseUrl = 'https://backend-453t.onrender.com';
+    }
     const resetLink = `${baseUrl}/reset?token=${token}&email=${encodeURIComponent(cleanEmail)}`;
 
     try {
