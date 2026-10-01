@@ -11,7 +11,7 @@ const config = {
   corsOrigin: process.env.CORS_ORIGIN || '*',
   resend: {
     apiKey: process.env.RESEND_API_KEY || '',
-    from: process.env.RESEND_FROM_EMAIL || 'Rivava TrackFi <onboarding@resend.dev>'
+    from: process.env.RESEND_FROM_EMAIL || 'Rivava TrackFi <support@rivava.in>'
   },
   smtp: {
     host: process.env.SMTP_HOST || '',
