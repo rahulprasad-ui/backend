@@ -251,7 +251,7 @@ class AuthController {
     ${hasToken ? `
     <div class="app-action-box">
       <div class="app-action-text">Have the app installed?</div>
-      <a href="${appDeepLink}" class="app-btn" id="appLaunchBtn">Open App &rarr;</a>
+      <a href="${intentLink}" class="app-btn" id="appLaunchBtn">Open App &rarr;</a>
     </div>
 
     <div class="divider">Or Reset on Web</div>
@@ -287,7 +287,7 @@ class AuthController {
       <div class="success-icon">🎉</div>
       <h2 style="font-size: 20px; font-weight: 700; color: #86EFAC; margin-bottom: 8px;">Password Updated!</h2>
       <p style="font-size: 14px; color: #94A3B8; margin-bottom: 24px;">Your password has been changed successfully. You can now open the app and log in.</p>
-      <a href="${appDeepLink}" class="submit-btn" style="text-decoration: none; text-align: center;">Open Rivava TrackFi</a>
+      <a href="${intentLink}" class="submit-btn" style="text-decoration: none; text-align: center;">Open Rivava TrackFi</a>
     </div>
     ` : `
     <div class="alert alert-error" style="display: block;">

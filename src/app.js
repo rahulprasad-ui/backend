@@ -49,6 +49,7 @@ app.get('/.well-known/assetlinks.json', (req, res) => {
         namespace: 'android_app',
         package_name: 'com.rivavafi.universal',
         sha256_cert_fingerprints: [
+          '07:CE:DF:4A:54:59:FF:EB:BA:BC:49:25:38:1F:E0:E9:D0:20:7A:E7:C7:EE:5B:1D:5C:81:40:10:6E:95:71:8E',
           '46:0E:2B:3A:CB:58:69:46:94:5B:85:F5:F9:3E:2F:8F:65:7E:FB:3E',
           '10:C5:EC:FE:27:83:37:8B:DE:55:E0:6A:29:E2:48:7B:EC:AA:F3:AD',
           'B3:0B:15:18:79:88:93:D9:80:C5:65:F8:EE:08:A2:BE:A5:43:90:AC'
