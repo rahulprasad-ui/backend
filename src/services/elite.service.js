@@ -40,7 +40,7 @@ class EliteService {
       orderId,
       amount: amountInRupees,
       currency: 'INR',
-      paymentUrl: `https://backend-6fey.onrender.com/pay/${orderId}`
+      paymentUrl: `https://backend-453t.onrender.com/pay/${orderId}`
     };
   }
 
