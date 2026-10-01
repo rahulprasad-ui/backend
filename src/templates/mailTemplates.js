@@ -300,7 +300,7 @@ const getPasswordResetEmailHtml = (email, resetLink, name = '') => {
                             <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
                                 <tr>
                                     <td align="center" style="padding: 10px 0 24px 0;">
-                                        <a href="${resetLink}" target="_blank" style="display: inline-block; background-color: #2563EB; color: #ffffff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-size: 15px; font-weight: 700;">
+                                        <a href="${resetLink}" style="display: inline-block; background-color: #2563EB; color: #ffffff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-size: 15px; font-weight: 700;">
                                             Reset Password
                                         </a>
                                     </td>
