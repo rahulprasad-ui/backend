@@ -11,37 +11,12 @@ class EliteService {
     if (!uid) {
       throw ApiError.badRequest('User ID is required.');
     }
-
-    const orderId = `elite_order_${uid}_${Date.now()}`;
-    const amountInRupees = amount ? amount / 100 : 399;
-    const now = Date.now();
-
-    const orderData = {
-      orderId,
+    const PaymentService = require('./payment.service');
+    return await PaymentService.createOrder({
       userId: uid,
-      plan,
-      amount: amountInRupees,
       amountPaise: amount || 39900,
-      currency: 'INR',
-      status: 'created',
-      gatewayProvider: 'razorpay',
-      createdAt: now,
-      updatedAt: now
-    };
-
-    try {
-      await admin.firestore().collection('payments').doc(orderId).set(orderData);
-      logger.info(`Elite order created in Firestore: ${orderId} for UID: ${uid}`);
-    } catch (e) {
-      logger.warn(`Firestore elite order notice: ${e.message}`);
-    }
-
-    return {
-      orderId,
-      amount: amountInRupees,
-      currency: 'INR',
-      paymentUrl: `https://backend-453t.onrender.com/pay/${orderId}`
-    };
+      plan: plan || 'elite_399'
+    });
   }
 
   /**
@@ -51,47 +26,11 @@ class EliteService {
     if (!uid || !orderId) {
       throw ApiError.badRequest('User ID and Order ID are required.');
     }
-
-    const now = Date.now();
-    const nextBilling = now + 365 * 24 * 60 * 60 * 1000; // 1 year membership
-
-    // 1. Update Payment Record in Firestore
-    await admin.firestore().collection('payments').doc(orderId).set({
-      status: 'success',
-      paymentId: `txn_${Date.now()}`,
-      verifiedAt: now,
-      updatedAt: now
-    }, { merge: true });
-
-    // 2. Activate Elite in Firestore therivdata collection
-    await admin.firestore().collection('therivdata').doc(uid).set({
-      isElite: true,
-      tier: 'elite',
-      elite_plan: 'elite_399',
-      monthlyMinutes: 600,
-      minutesRemaining: 600,
-      freeSessionsCount: 1,
-      premiumStatus: true,
-      isPremium: true,
-      nextBillingDate: nextBilling,
-      paymentStatus: 'active',
-      updatedAt: now
-    }, { merge: true });
-
-    NotificationService.sendToUser(uid, {
-      title: '👑 Welcome to Elite Club!',
-      body: 'Your Elite Membership is now active. Enjoy priority advisory and exclusive perks.',
-      data: { type: 'ELITE_ACTIVATED', orderId }
-    }).catch(() => {});
-
-    logger.info(`Elite payment verified in Firebase Firestore for user ${uid}, order: ${orderId}`);
-    return {
-      success: true,
-      isElite: true,
-      plan: 'elite_399',
-      expiresAt: new Date(nextBilling).toISOString(),
-      minutesRemaining: 600
-    };
+    const PaymentService = require('./payment.service');
+    return await PaymentService.verifyPayment({
+      userId: uid,
+      orderId
+    });
   }
 
   /**
@@ -116,18 +55,28 @@ class EliteService {
     await admin.firestore().collection('elite_sessions').doc(sessionId).set({
       id: sessionId,
       userId: uid,
+      uid: uid,
       duration: numDuration,
+      minutesBooked: numDuration,
       dateMillis,
+      selectedDate: admin.firestore.Timestamp.fromMillis(dateMillis),
+      selectedTime: time,
       timeSlot: time,
-      status: 'booked',
+      status: 'confirmed',
+      meetingLink: 'https://meet.google.com/riv-elite-advisory',
       createdAt: now
     });
 
-    // Update remaining minutes in Firestore
+    // Update remaining minutes in Firestore collections
     await admin.firestore().collection('therivdata').doc(uid).set({
       minutesRemaining: newMinutes,
       updatedAt: now
     }, { merge: true });
+
+    await admin.firestore().collection('users').doc(uid).collection('subscription').doc('current').set({
+      minutesRemaining: newMinutes,
+      updatedAt: now
+    }, { merge: true }).catch(() => {});
 
     NotificationService.sendToUser(uid, {
       title: '📅 Session Booked',

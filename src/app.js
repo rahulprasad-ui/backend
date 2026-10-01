@@ -65,6 +65,10 @@ app.get('/verify', VerificationController.verifyToken);
 // Direct Link for Password Reset Web Redirect (e.g. /reset?token=...&email=...)
 app.get('/reset', AuthController.handleResetRedirect);
 
+// Web Razorpay Checkout Page (e.g. /pay/:orderId)
+const PaymentController = require('./controllers/payment.controller');
+app.get('/pay/:orderId', PaymentController.renderCheckoutPage);
+
 // Root Landing & Status Endpoint
 app.get('/', (req, res) => {
   res.status(200).json({

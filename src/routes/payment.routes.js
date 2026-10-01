@@ -12,6 +12,9 @@ router.post('/verify-payment', optionalAuth, PaymentController.verifyPayment); /
 // Webhook listener (called directly by Gateway)
 router.post('/webhook', PaymentController.handleWebhook);
 
+// Web checkout
+router.get('/pay/:orderId', PaymentController.renderCheckoutPage);
+
 // User payment history
 router.get('/history', optionalAuth, PaymentController.getHistory);
 

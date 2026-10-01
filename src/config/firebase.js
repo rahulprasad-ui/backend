@@ -44,6 +44,10 @@ function initFirebase() {
     logger.warn(`Firebase Admin initialization notice: ${error.message}`);
   }
 
+  try {
+    admin.firestore().settings({ ignoreUndefinedProperties: true });
+  } catch (_) {}
+
   return { admin };
 }
 
