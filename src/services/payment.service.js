@@ -47,36 +47,44 @@ class PaymentService {
 
     const numAmountPaise = Math.max(100, Number(amountPaise) || 1100);
     const amountInRupees = numAmountPaise / 100;
-    let orderId = `order_${userId.substring(0, 8)}_${Date.now()}`;
     const now = Date.now();
 
     const keyId = config.paymentGateway.keyId;
     const keySecret = config.paymentGateway.keySecret;
 
-    // Create real Razorpay order if live/test credentials are configured
-    if (keyId && keySecret && !keyId.includes('mock') && !keySecret.includes('mock')) {
-      try {
-        const axios = require('axios');
-        const authHeader = 'Basic ' + Buffer.from(`${keyId}:${keySecret}`).toString('base64');
-        const rzpRes = await axios.post('https://api.razorpay.com/v1/orders', {
-          amount: numAmountPaise,
-          currency: config.paymentGateway.currency,
-          receipt: `rcpt_${userId.substring(0, 6)}_${Date.now()}`,
-          notes: { userId, plan }
-        }, {
-          headers: {
-            'Authorization': authHeader,
-            'Content-Type': 'application/json'
-          }
-        });
+    if (!keyId || !keySecret || keyId.includes('mock') || keySecret.includes('mock')) {
+      throw ApiError.internal('Payment gateway is not configured. Please contact support.');
+    }
 
-        if (rzpRes.data && rzpRes.data.id) {
-          orderId = rzpRes.data.id;
-          logger.info(`Razorpay API Order created: ${orderId}`);
+    // Always create a real Razorpay order — never fall back to a mock orderId.
+    // A fake orderId (order_userId_timestamp) causes key-order mismatch and breaks
+    // UPI checkout on Android (order_id won't be attached, limiting payment methods).
+    let orderId;
+    try {
+      const axios = require('axios');
+      const authHeader = 'Basic ' + Buffer.from(`${keyId}:${keySecret}`).toString('base64');
+      const rzpRes = await axios.post('https://api.razorpay.com/v1/orders', {
+        amount: numAmountPaise,
+        currency: config.paymentGateway.currency,
+        receipt: `rcpt_${userId.substring(0, 6)}_${Date.now()}`,
+        notes: { userId, plan }
+      }, {
+        headers: {
+          'Authorization': authHeader,
+          'Content-Type': 'application/json'
         }
-      } catch (rzpErr) {
-        logger.warn(`Razorpay API order creation fallback: ${rzpErr.response ? JSON.stringify(rzpErr.response.data) : rzpErr.message}`);
+      });
+
+      if (rzpRes.data && rzpRes.data.id) {
+        orderId = rzpRes.data.id;
+        logger.info(`Razorpay API Order created: ${orderId}`);
+      } else {
+        throw new Error('Razorpay returned an empty order ID.');
       }
+    } catch (rzpErr) {
+      const errDetail = rzpErr.response ? JSON.stringify(rzpErr.response.data) : rzpErr.message;
+      logger.error(`Razorpay order creation failed: ${errDetail}`);
+      throw ApiError.internal(`Could not create payment order. Please try again.`);
     }
 
     const orderData = {
