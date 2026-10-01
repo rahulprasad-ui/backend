@@ -7,7 +7,7 @@ dotenv.config({ path: path.resolve(__dirname, '../../.env') });
 const config = {
   env: process.env.NODE_ENV || 'development',
   port: parseInt(process.env.PORT || '3000', 10),
-  baseUrl: process.env.BASE_URL || 'http://192.168.1.22:3000',
+  baseUrl: process.env.BASE_URL || 'https://backend-453t.onrender.com',
   corsOrigin: process.env.CORS_ORIGIN || '*',
   resend: {
     apiKey: process.env.RESEND_API_KEY || '',
