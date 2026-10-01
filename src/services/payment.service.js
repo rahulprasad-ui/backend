@@ -49,8 +49,8 @@ class PaymentService {
     const amountInRupees = numAmountPaise / 100;
     const now = Date.now();
 
-    const keyId = config.paymentGateway.keyId;
-    const keySecret = config.paymentGateway.keySecret;
+    const keyId = (config.paymentGateway.keyId || '').trim();
+    const keySecret = (config.paymentGateway.keySecret || '').trim();
 
     if (!keyId || !keySecret || keyId.includes('mock') || keySecret.includes('mock')) {
       throw ApiError.internal('Payment gateway is not configured. Please contact support.');
@@ -84,7 +84,7 @@ class PaymentService {
     } catch (rzpErr) {
       const errDetail = rzpErr.response ? JSON.stringify(rzpErr.response.data) : rzpErr.message;
       logger.error(`Razorpay order creation failed: ${errDetail}`);
-      throw ApiError.internal(`Could not create payment order. Please try again.`);
+      throw ApiError.internal(`Razorpay order creation failed: ${errDetail}`);
     }
 
     const orderData = {
